@@ -24,6 +24,15 @@ import logging
 import psutil
 
 try:
+    import psycopg
+    from psycopg.rows import dict_row
+    PSYCOPG_AVAILABLE = True
+except ImportError:
+    PSYCOPG_AVAILABLE = False
+    psycopg = None
+    dict_row = None
+
+try:
     import telebot
     from telebot.async_telebot import AsyncTeleBot
     from telebot import types
@@ -61,11 +70,11 @@ PANEL_VERSION = "1.1.0"
 GITHUB_REPO = "luffy-sh-op/LUFFY_PANEL"
 
 async def check_github_latest(force: bool = False) -> dict:
-    """Fetches the latest release tag from GitHub, caches in SQLite.
+    """Fetches the latest release tag from GitHub, caches in the active DB.
     Only actually calls the API if force=True or no cached data exists."""
     conn = get_db()
     try:
-        cur = conn.execute("SELECT latest_tag, latest_url, checked_at FROM github_cache WHERE id = 1")
+        cur = db_execute(conn, "SELECT latest_tag, latest_url, checked_at FROM github_cache WHERE id = ?", (1,))
         row = cur.fetchone()
     finally:
         conn.close()
@@ -105,8 +114,8 @@ async def check_github_latest(force: bool = False) -> dict:
 
     conn = get_db()
     try:
-        conn.execute("INSERT OR REPLACE INTO github_cache (id, latest_tag, latest_url, checked_at) VALUES (1, ?, ?, ?)",
-                     (new_tag, new_url, now))
+        db_execute(conn, "INSERT OR REPLACE INTO github_cache (id, latest_tag, latest_url, checked_at) VALUES (?, ?, ?, ?)",
+                     (1, new_tag, new_url, now))
         conn.commit()
     finally:
         conn.close()
@@ -139,7 +148,8 @@ async def github_check_loop():
 async def create_notification(type: str, title: str, message: str, link: str | None = None):
     conn = get_db()
     try:
-        conn.execute(
+        db_execute(
+            conn,
             "INSERT INTO notifications (type, title, message, link, created_at) VALUES (?, ?, ?, ?, ?)",
             (type, title, message, link, datetime.now(timezone.utc).isoformat()),
         )
@@ -152,7 +162,7 @@ async def create_notification(type: str, title: str, message: str, link: str | N
 async def get_unread_notification_count() -> int:
     conn = get_db()
     try:
-        cur = conn.execute("SELECT COUNT(*) as cnt FROM notifications WHERE seen = 0")
+        cur = db_execute(conn, "SELECT COUNT(*) as cnt FROM notifications WHERE seen = 0")
         row = cur.fetchone()
         return row["cnt"] if row else 0
     finally:
@@ -161,7 +171,8 @@ async def get_unread_notification_count() -> int:
 async def get_notifications(limit: int = 50) -> list:
     conn = get_db()
     try:
-        cur = conn.execute(
+        cur = db_execute(
+            conn,
             "SELECT id, type, title, message, link, seen, created_at FROM notifications ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
@@ -354,11 +365,22 @@ def variants_from_body(body: dict, base: dict | None = None) -> dict:
         result[auth] = cur
     return sanitize_variants(result)
 
+# ── Database backend selection (SQLite local vs Neon/Postgres remote) ─────
+# Prefer Neon / any Postgres when DATABASE_URL or NEON_DATABASE_URL is set.
+# Otherwise fall back to the original local SQLite file behaviour.
+DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL") or "").strip()
+USE_POSTGRES = bool(DATABASE_URL) and PSYCOPG_AVAILABLE
+
 DB_FILE = "/data/panel.db" if os.path.isdir("/data") else "panel.db"
-if os.path.isdir("/data"):
+if USE_POSTGRES:
+    logger.warning("[STARTUP] DATABASE_URL / NEON_DATABASE_URL detected -> using remote Postgres (Neon)")
+elif os.path.isdir("/data"):
     logger.warning(f"[STARTUP] Persistent volume detected at /data -> using {DB_FILE} (data survives restarts/deploys)")
 else:
     logger.warning(f"[STARTUP] NO persistent volume found at /data -> using EPHEMERAL {DB_FILE} (ALL links/data will be LOST on next restart/deploy!)")
+    if DATABASE_URL and not PSYCOPG_AVAILABLE:
+        logger.error("[STARTUP] DATABASE_URL is set but psycopg is not installed — falling back to local SQLite. Install psycopg[binary].")
+
 DB_LOCK = asyncio.Lock()
 bot = None
 bot_polling_task: asyncio.Task | None = None
@@ -557,9 +579,100 @@ def build_main_keyboard():
     )
     return kb
 
-# ── SQLite Database ──────────────────────────────────────────────────────
+# ── Database layer (SQLite local OR Postgres/Neon remote) ─────────────────
+# When USE_POSTGRES is True every query uses %s placeholders and Postgres
+# dialect (ON CONFLICT). When False the original SQLite ? placeholders and
+# INSERT OR REPLACE behaviour is preserved unchanged.
+
+def _q(sql: str) -> str:
+    """Adapt a SQLite-style SQL string for the active backend."""
+    if not USE_POSTGRES:
+        return sql
+    # Placeholder conversion
+    sql = sql.replace("?", "%s")
+    # Common SQLite → Postgres rewrites used in this codebase
+    sql = sql.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+    sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+    return sql
+
+def _on_conflict_auth(sql: str) -> str:
+    if not USE_POSTGRES:
+        return sql
+    if "INTO auth" in sql.upper():
+        return sql + " ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash"
+    return sql
+
+def _on_conflict_settings(sql: str) -> str:
+    if not USE_POSTGRES:
+        return sql
+    if "INTO settings" in sql.upper():
+        return sql + " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+    return sql
+
+def _on_conflict_links(sql: str) -> str:
+    if not USE_POSTGRES:
+        return sql
+    if "INTO links" in sql.upper():
+        return (sql + " ON CONFLICT (uuid) DO UPDATE SET "
+                "label=EXCLUDED.label, limit_bytes=EXCLUDED.limit_bytes, used_bytes=EXCLUDED.used_bytes, "
+                "max_connections=EXCLUDED.max_connections, created_at=EXCLUDED.created_at, "
+                "active=EXCLUDED.active, expires_at=EXCLUDED.expires_at, protocol=EXCLUDED.protocol, "
+                "fingerprint=EXCLUDED.fingerprint, alpn=EXCLUDED.alpn, port=EXCLUDED.port, "
+                "variants_json=EXCLUDED.variants_json")
+    return sql
+
+def _on_conflict_github(sql: str) -> str:
+    if not USE_POSTGRES:
+        return sql
+    if "INTO github_cache" in sql.upper():
+        return sql + " ON CONFLICT (id) DO UPDATE SET latest_tag=EXCLUDED.latest_tag, latest_url=EXCLUDED.latest_url, checked_at=EXCLUDED.checked_at"
+    return sql
+
+def _on_conflict_addresses(sql: str) -> str:
+    if not USE_POSTGRES:
+        return sql
+    if "INTO custom_addresses" in sql.upper():
+        return sql + " ON CONFLICT (address) DO NOTHING"
+    return sql
+
+def db_execute(conn, sql: str, params=None):
+    """Execute SQL with automatic dialect adaptation."""
+    if not USE_POSTGRES:
+        if params is None:
+            return conn.execute(sql)
+        return conn.execute(sql, params)
+
+    compact = " ".join(sql.split()).upper()
+    base = sql
+    if "INSERT OR REPLACE INTO" in compact:
+        base = sql.replace("INSERT OR REPLACE INTO", "INSERT INTO").replace("insert or replace into", "INSERT INTO")
+        if "INTO AUTH " in compact or compact.endswith("INTO AUTH"):
+            s = _on_conflict_auth(_q(base))
+        elif "INTO SETTINGS " in compact or "INTO SETTINGS(" in compact:
+            s = _on_conflict_settings(_q(base))
+        elif "INTO LINKS " in compact or "INTO LINKS(" in compact:
+            s = _on_conflict_links(_q(base))
+        elif "INTO GITHUB_CACHE " in compact or "INTO GITHUB_CACHE(" in compact:
+            s = _on_conflict_github(_q(base))
+        else:
+            s = _q(base)
+    elif "INSERT OR IGNORE INTO" in compact:
+        base = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO").replace("insert or ignore into", "INSERT INTO")
+        if "CUSTOM_ADDRESSES" in compact:
+            s = _on_conflict_addresses(_q(base))
+        else:
+            s = _q(base)
+    else:
+        s = _q(sql)
+
+    if params is None:
+        return conn.execute(s)
+    return conn.execute(s, params)
 
 def get_db():
+    if USE_POSTGRES:
+        conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        return conn
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -568,76 +681,155 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS links (
-            uuid TEXT PRIMARY KEY,
-            label TEXT NOT NULL,
-            limit_bytes INTEGER DEFAULT 0,
-            used_bytes INTEGER DEFAULT 0,
-            max_connections INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            active INTEGER DEFAULT 1,
-            expires_at TEXT,
-            protocol TEXT DEFAULT 'vless-ws',
-            fingerprint TEXT DEFAULT 'chrome',
-            alpn TEXT DEFAULT '',
-            port INTEGER DEFAULT 443
-        );
-        CREATE TABLE IF NOT EXISTS custom_addresses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            address TEXT NOT NULL UNIQUE
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            expires_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS auth (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            password_hash TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            message TEXT NOT NULL,
-            link TEXT,
-            seen INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS github_cache (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            latest_tag TEXT,
-            latest_url TEXT,
-            checked_at REAL
-        );
-    """)
-    conn.commit()
-    # Migrate older DBs created before protocol/fingerprint/alpn/port existed
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(links)").fetchall()}
-    for col, ddl in (
-        ("protocol", "ALTER TABLE links ADD COLUMN protocol TEXT DEFAULT 'vless-ws'"),
-        ("fingerprint", "ALTER TABLE links ADD COLUMN fingerprint TEXT DEFAULT 'chrome'"),
-        ("alpn", "ALTER TABLE links ADD COLUMN alpn TEXT DEFAULT ''"),
-        ("port", "ALTER TABLE links ADD COLUMN port INTEGER DEFAULT 443"),
-        ("variants_json", "ALTER TABLE links ADD COLUMN variants_json TEXT DEFAULT ''"),
-    ):
-        if col not in existing_cols:
-            conn.execute(ddl)
-    conn.commit()
-    # Ensure default auth row
-    cur = conn.execute("SELECT password_hash FROM auth WHERE id = 1")
-    row = cur.fetchone()
-    if row is None:
-        conn.execute("INSERT INTO auth (id, password_hash) VALUES (1, ?)", (AUTH["password_hash"],))
-        conn.commit()
-    else:
-        AUTH["password_hash"] = row["password_hash"]
-    conn.close()
-    migrate_json_to_sqlite()
+    try:
+        if USE_POSTGRES:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS links (
+                    uuid TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    limit_bytes BIGINT DEFAULT 0,
+                    used_bytes BIGINT DEFAULT 0,
+                    max_connections INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    expires_at TEXT,
+                    protocol TEXT DEFAULT 'vless-ws',
+                    fingerprint TEXT DEFAULT 'chrome',
+                    alpn TEXT DEFAULT '',
+                    port INTEGER DEFAULT 443,
+                    variants_json TEXT DEFAULT ''
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS custom_addresses (
+                    id SERIAL PRIMARY KEY,
+                    address TEXT NOT NULL UNIQUE
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    expires_at DOUBLE PRECISION NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS auth (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    password_hash TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id SERIAL PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    link TEXT,
+                    seen INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS github_cache (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    latest_tag TEXT,
+                    latest_url TEXT,
+                    checked_at DOUBLE PRECISION
+                )
+            """)
+            conn.commit()
+            # Ensure columns exist on older Neon schemas
+            for col, ddl in (
+                ("protocol", "ALTER TABLE links ADD COLUMN IF NOT EXISTS protocol TEXT DEFAULT 'vless-ws'"),
+                ("fingerprint", "ALTER TABLE links ADD COLUMN IF NOT EXISTS fingerprint TEXT DEFAULT 'chrome'"),
+                ("alpn", "ALTER TABLE links ADD COLUMN IF NOT EXISTS alpn TEXT DEFAULT ''"),
+                ("port", "ALTER TABLE links ADD COLUMN IF NOT EXISTS port INTEGER DEFAULT 443"),
+                ("variants_json", "ALTER TABLE links ADD COLUMN IF NOT EXISTS variants_json TEXT DEFAULT ''"),
+            ):
+                try:
+                    conn.execute(ddl)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+        else:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS links (
+                    uuid TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    limit_bytes INTEGER DEFAULT 0,
+                    used_bytes INTEGER DEFAULT 0,
+                    max_connections INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    expires_at TEXT,
+                    protocol TEXT DEFAULT 'vless-ws',
+                    fingerprint TEXT DEFAULT 'chrome',
+                    alpn TEXT DEFAULT '',
+                    port INTEGER DEFAULT 443
+                );
+                CREATE TABLE IF NOT EXISTS custom_addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    address TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    expires_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auth (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    password_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    link TEXT,
+                    seen INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS github_cache (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    latest_tag TEXT,
+                    latest_url TEXT,
+                    checked_at REAL
+                );
+            """)
+            conn.commit()
+            existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(links)").fetchall()}
+            for col, ddl in (
+                ("protocol", "ALTER TABLE links ADD COLUMN protocol TEXT DEFAULT 'vless-ws'"),
+                ("fingerprint", "ALTER TABLE links ADD COLUMN fingerprint TEXT DEFAULT 'chrome'"),
+                ("alpn", "ALTER TABLE links ADD COLUMN alpn TEXT DEFAULT ''"),
+                ("port", "ALTER TABLE links ADD COLUMN port INTEGER DEFAULT 443"),
+                ("variants_json", "ALTER TABLE links ADD COLUMN variants_json TEXT DEFAULT ''"),
+            ):
+                if col not in existing_cols:
+                    conn.execute(ddl)
+            conn.commit()
+
+        # Ensure default auth row
+        cur = db_execute(conn, "SELECT password_hash FROM auth WHERE id = ?", (1,))
+        row = cur.fetchone()
+        if row is None:
+            db_execute(conn, "INSERT INTO auth (id, password_hash) VALUES (?, ?)", (1, AUTH["password_hash"]))
+            conn.commit()
+        else:
+            AUTH["password_hash"] = row["password_hash"] if isinstance(row, dict) else row["password_hash"]
+    finally:
+        conn.close()
+    if not USE_POSTGRES:
+        migrate_json_to_sqlite()
 
 def migrate_json_to_sqlite():
     json_file = "panel_db.json"
@@ -693,13 +885,13 @@ async def save_db():
     try:
         async with DB_LOCK:
             # Save auth
-            conn.execute("INSERT OR REPLACE INTO auth (id, password_hash) VALUES (1, ?)", (AUTH["password_hash"],))
+            db_execute(conn, "INSERT OR REPLACE INTO auth (id, password_hash) VALUES (?, ?)", (1, AUTH["password_hash"]))
             # Save links
             async with LINKS_LOCK:
                 for uid, link in list(LINKS.items()):
                     variants = sanitize_variants(link.get("variants"))
                     legacy_protocol, legacy_fp, legacy_alpn = variants_to_legacy(variants)
-                    conn.execute("""
+                    db_execute(conn, """
                         INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, protocol, fingerprint, alpn, port, variants_json)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (uid, link["label"], link["limit_bytes"], link["used_bytes"],
@@ -709,12 +901,12 @@ async def save_db():
                           json.dumps(variants)))
             # Save addresses
             async with CUSTOM_ADDRESSES_LOCK:
-                conn.execute("DELETE FROM custom_addresses")
+                db_execute(conn, "DELETE FROM custom_addresses")
                 for addr in CUSTOM_ADDRESSES:
-                    conn.execute("INSERT INTO custom_addresses (address) VALUES (?)", (addr,))
+                    db_execute(conn, "INSERT INTO custom_addresses (address) VALUES (?)", (addr,))
             # Save settings
             for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections"):
-                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, CONFIG.get(key, "")))
+                db_execute(conn, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, CONFIG.get(key, "")))
             conn.commit()
     except Exception as e:
         logger.error(f"Error saving DB: {e}")
@@ -726,15 +918,17 @@ def load_db():
     conn = get_db()
     try:
         # Load auth
-        cur = conn.execute("SELECT password_hash FROM auth WHERE id = 1")
+        cur = db_execute(conn, "SELECT password_hash FROM auth WHERE id = ?", (1,))
         row = cur.fetchone()
         if row:
             AUTH["password_hash"] = row["password_hash"]
         # Load links
         LINKS.clear()
-        cur = conn.execute("SELECT * FROM links")
+        cur = db_execute(conn, "SELECT * FROM links")
         for row in cur.fetchall():
-            variants_raw = row["variants_json"] if "variants_json" in row.keys() else None
+            # Support both sqlite3.Row (.keys()) and psycopg dict_row
+            keys = row.keys() if hasattr(row, "keys") else row
+            variants_raw = row["variants_json"] if "variants_json" in keys else None
             variants = None
             if variants_raw:
                 try:
@@ -756,18 +950,17 @@ def load_db():
             }
         # Load addresses
         CUSTOM_ADDRESSES.clear()
-        cur = conn.execute("SELECT address FROM custom_addresses")
+        cur = db_execute(conn, "SELECT address FROM custom_addresses")
         rows = cur.fetchall()
         if rows:
             CUSTOM_ADDRESSES.extend(row["address"] for row in rows)
-        # پاک‌سازی یک‌بارمصرف: آدرس پیش‌فرض قدیمی رو دیگه نمی‌خوایم، حتی اگه از قبل
-        # تو دیتابیس ذخیره شده باشه.
+        # One-time cleanup of the old default address
         if "www.speedtest.net" in CUSTOM_ADDRESSES:
             CUSTOM_ADDRESSES.remove("www.speedtest.net")
-            conn.execute("DELETE FROM custom_addresses WHERE address = ?", ("www.speedtest.net",))
+            db_execute(conn, "DELETE FROM custom_addresses WHERE address = ?", ("www.speedtest.net",))
             conn.commit()
         # Load settings
-        cur = conn.execute("SELECT key, value FROM settings")
+        cur = db_execute(conn, "SELECT key, value FROM settings")
         for row in cur.fetchall():
             CONFIG[row["key"]] = row["value"]
     except Exception as e:
@@ -785,7 +978,7 @@ async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     conn = get_db()
     try:
-        conn.execute("INSERT INTO sessions (token, expires_at) VALUES (?, ?)", (token, time.time() + SESSION_TTL))
+        db_execute(conn, "INSERT INTO sessions (token, expires_at) VALUES (?, ?)", (token, time.time() + SESSION_TTL))
         conn.commit()
     finally:
         conn.close()
@@ -796,10 +989,10 @@ async def is_valid_session(token: str | None) -> bool:
         return False
     conn = get_db()
     try:
-        cur = conn.execute("SELECT expires_at FROM sessions WHERE token = ?", (token,))
+        cur = db_execute(conn, "SELECT expires_at FROM sessions WHERE token = ?", (token,))
         row = cur.fetchone()
         if row is None or row["expires_at"] < time.time():
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            db_execute(conn, "DELETE FROM sessions WHERE token = ?", (token,))
             conn.commit()
             return False
         return True
@@ -810,7 +1003,7 @@ async def destroy_session(token: str | None):
     if token:
         conn = get_db()
         try:
-            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            db_execute(conn, "DELETE FROM sessions WHERE token = ?", (token,))
             conn.commit()
         finally:
             conn.close()
@@ -818,7 +1011,7 @@ async def destroy_session(token: str | None):
 async def clear_expired_sessions():
     conn = get_db()
     try:
-        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+        db_execute(conn, "DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
         conn.commit()
     finally:
         conn.close()
@@ -1019,9 +1212,10 @@ def migrate_legacy_uuids():
             if _UUID_RE.match(old_uid):
                 continue
             new_uid = str(uuid.uuid4())
-            conn.execute("DELETE FROM links WHERE uuid = ?", (old_uid,))
-            conn.execute("""
-                INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
+            db_execute(conn, "DELETE FROM links WHERE uuid = ?", (old_uid,))
+            # Plain INSERT is safe here: we just deleted any conflicting row
+            db_execute(conn, """
+                INSERT INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (new_uid, link["label"], link["limit_bytes"], link["used_bytes"],
                   link.get("max_connections", 0), link["created_at"],
@@ -1572,9 +1766,9 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     current_token = request.cookies.get(SESSION_COOKIE)
     conn = get_db()
     try:
-        conn.execute("DELETE FROM sessions")
+        db_execute(conn, "DELETE FROM sessions")
         if current_token:
-            conn.execute("INSERT INTO sessions (token, expires_at) VALUES (?, ?)", (current_token, time.time() + SESSION_TTL))
+            db_execute(conn, "INSERT INTO sessions (token, expires_at) VALUES (?, ?)", (current_token, time.time() + SESSION_TTL))
         conn.commit()
     finally:
         conn.close()
@@ -1587,7 +1781,35 @@ async def get_settings(_=Depends(require_auth)):
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "railway_token": CONFIG.get("railway_token", ""),
         "notify_connections": CONFIG.get("notify_connections", "0") in ("1", "true", "True", True),
+        "using_neon": USE_POSTGRES,
     }
+
+@app.get("/api/setup-status")
+async def api_setup_status(_=Depends(require_auth)):
+    """One-time first-run popup status. seen is stored in the active DB."""
+    conn = get_db()
+    try:
+        cur = db_execute(conn, "SELECT value FROM settings WHERE key = ?", ("setup_popup_seen",))
+        row = cur.fetchone()
+        seen = bool(row and str(row["value"]) in ("1", "true", "True"))
+    finally:
+        conn.close()
+    return {
+        "seen": seen,
+        "using_neon": USE_POSTGRES,
+        "db_backend": "neon" if USE_POSTGRES else "sqlite",
+    }
+
+@app.post("/api/setup-dismiss")
+async def api_setup_dismiss(_=Depends(require_auth)):
+    """Mark the first-run setup popup as seen so it never shows again."""
+    conn = get_db()
+    try:
+        db_execute(conn, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("setup_popup_seen", "1"))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
 
 @app.post("/api/settings")
 async def update_settings(request: Request, _=Depends(require_auth)):
@@ -2023,7 +2245,7 @@ async def api_notification_count(_=Depends(require_auth)):
 async def api_mark_seen(nid: int, _=Depends(require_auth)):
     conn = get_db()
     try:
-        conn.execute("UPDATE notifications SET seen = 1 WHERE id = ?", (nid,))
+        db_execute(conn, "UPDATE notifications SET seen = 1 WHERE id = ?", (nid,))
         conn.commit()
     finally:
         conn.close()
@@ -2033,7 +2255,7 @@ async def api_mark_seen(nid: int, _=Depends(require_auth)):
 async def api_mark_all_seen(_=Depends(require_auth)):
     conn = get_db()
     try:
-        conn.execute("UPDATE notifications SET seen = 1 WHERE seen = 0")
+        db_execute(conn, "UPDATE notifications SET seen = 1 WHERE seen = 0")
         conn.commit()
     finally:
         conn.close()
@@ -2043,7 +2265,7 @@ async def api_mark_all_seen(_=Depends(require_auth)):
 async def api_clear_notifications(_=Depends(require_auth)):
     conn = get_db()
     try:
-        conn.execute("DELETE FROM notifications")
+        db_execute(conn, "DELETE FROM notifications")
         conn.commit()
     finally:
         conn.close()
@@ -4188,6 +4410,16 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   </div>
 </div>
 
+<!-- First-run setup / welcome modal (shows only once) -->
+<div class="mo" id="mo-setup" onclick="if(event.target===this)dismissSetup()">
+  <div class="mo-box" style="max-width:440px;text-align:left">
+    <button class="mo-close" onclick="dismissSetup()">✕</button>
+    <div class="mo-title" id="setup-title" style="margin-bottom:12px">DATABASE SETUP</div>
+    <div id="setup-body" style="font-size:13px;line-height:1.65;color:var(--text2);margin-bottom:18px"></div>
+    <div id="setup-actions" style="display:flex;flex-direction:column;gap:10px"></div>
+  </div>
+</div>
+
 <script>
 function $(s){return document.querySelector(s)}
 function $m(id){return document.getElementById(id)}
@@ -4295,7 +4527,7 @@ function showLogin(){
 function showDashboard(){
   isAuthenticated=true;
   $m('login-page').style.display='none';
-  $m('dashboard-page').style.display='';
+  $m('dashboard-page').style.display='block';
   initChart();
   loadStats();
   loadLinks();
@@ -4304,6 +4536,63 @@ function showDashboard(){
   loadNotifs();
   updateNotifBadge();
   connectLogsWS();
+  checkSetupPopup();
+}
+
+async function checkSetupPopup(){
+  try{
+    const r=await fetch('/api/setup-status');
+    if(!r.ok)return;
+    const d=await r.json();
+    if(d.seen)return;
+    showSetupPopup(!!d.using_neon);
+  }catch(e){}
+}
+
+function showSetupPopup(usingNeon){
+  const title=$m('setup-title');
+  const body=$m('setup-body');
+  const actions=$m('setup-actions');
+  if(usingNeon){
+    title.textContent='WELCOME — NEON.TECH READY';
+    body.innerHTML=
+      '<p style="margin-bottom:10px"><b style="color:var(--gold)">Neon.tech remote database is configured and active.</b></p>'+
+      '<p style="margin-bottom:10px">Your inbounds, quotas, clean IPs and settings are stored on Neon and survive Render restarts and redeploys.</p>'+
+      '<p style="margin-bottom:8px;color:var(--text3)"><b>Quick tour</b></p>'+
+      '<ul style="margin:0 0 12px 18px;padding:0;color:var(--text3)">'+
+      '<li><b>Inbounds</b> — create users, set traffic limits &amp; expiry</li>'+
+      '<li><b>Sub</b> — copy the subscription link for v2rayNG / Hiddify</li>'+
+      '<li><b>Clean IP</b> — add alternative addresses if the hostname is blocked</li>'+
+      '<li><b>Settings</b> — Telegram bot, Railway volume helpers, password</li>'+
+      '</ul>';
+    actions.innerHTML='<button class="btn btn-gold" onclick="dismissSetup()" style="width:100%;justify-content:center;padding:12px">Great!</button>';
+  }else{
+    title.textContent='DATABASE SETUP';
+    body.innerHTML=
+      '<p style="margin-bottom:10px"><b style="color:var(--gold)">No Neon.tech connection detected.</b></p>'+
+      '<p style="margin-bottom:10px">The panel is currently using the <b>local SQLite</b> file. On free Render this storage is <b>ephemeral</b> — data is lost on every restart or redeploy unless you attach a persistent disk (or switch to Neon).</p>'+
+      '<p style="margin-bottom:8px;color:var(--text3)"><b>How to use Neon.tech (recommended)</b></p>'+
+      '<ol style="margin:0 0 12px 18px;padding:0;color:var(--text3);font-size:12px">'+
+      '<li>Create a free project at <a href="https://neon.tech" target="_blank" style="color:var(--gold)">neon.tech</a></li>'+
+      '<li>Copy the connection string (it starts with <code>postgresql://...</code>)</li>'+
+      '<li>In your host (Render / Railway) add an environment variable:</li>'+
+      '</ol>'+
+      '<div style="background:var(--surface3);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:monospace;font-size:12px;margin-bottom:12px;word-break:break-all">'+
+      '<div><span style="color:var(--gold)">Name:</span> DATABASE_URL</div>'+
+      '<div style="margin-top:4px"><span style="color:var(--gold)">Value:</span> postgresql://user:pass@ep-xxx.region.aws.neon.tech/neondb?sslmode=require</div>'+
+      '</div>'+
+      '<p style="font-size:12px;color:var(--text3);margin-bottom:4px">You can also use the name <code>NEON_DATABASE_URL</code>. Redeploy after saving the variable.</p>';
+    actions.innerHTML=
+      '<button class="btn btn-ghost" onclick="dismissSetup()" style="width:100%;justify-content:center;padding:12px;border-color:rgba(248,113,113,.3);color:var(--red)">'+
+      'Use local SQLite instead (fragile on free Render)</button>'+
+      '<button class="btn btn-gold" onclick="dismissSetup()" style="width:100%;justify-content:center;padding:12px">Got it</button>';
+  }
+  $m('mo-setup').classList.add('show');
+}
+
+async function dismissSetup(){
+  $m('mo-setup').classList.remove('show');
+  try{await fetch('/api/setup-dismiss',{method:'POST'})}catch(e){}
 }
 
 async function doLogin(){
