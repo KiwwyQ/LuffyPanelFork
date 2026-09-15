@@ -218,6 +218,7 @@ CONFIG = {
     "bot_lang": "en",
     "railway_token": "",
     "notify_connections": "0",
+    "warp_enabled": "0",
 }
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -618,7 +619,7 @@ def _on_conflict_links(sql: str) -> str:
                 "max_connections=EXCLUDED.max_connections, created_at=EXCLUDED.created_at, "
                 "active=EXCLUDED.active, expires_at=EXCLUDED.expires_at, protocol=EXCLUDED.protocol, "
                 "fingerprint=EXCLUDED.fingerprint, alpn=EXCLUDED.alpn, port=EXCLUDED.port, "
-                "variants_json=EXCLUDED.variants_json")
+                "variants_json=EXCLUDED.variants_json, use_warp=EXCLUDED.use_warp")
     return sql
 
 def _on_conflict_github(sql: str) -> str:
@@ -751,6 +752,7 @@ def init_db():
                 ("alpn", "ALTER TABLE links ADD COLUMN IF NOT EXISTS alpn TEXT DEFAULT ''"),
                 ("port", "ALTER TABLE links ADD COLUMN IF NOT EXISTS port INTEGER DEFAULT 443"),
                 ("variants_json", "ALTER TABLE links ADD COLUMN IF NOT EXISTS variants_json TEXT DEFAULT ''"),
+                ("use_warp", "ALTER TABLE links ADD COLUMN IF NOT EXISTS use_warp INTEGER DEFAULT 0"),
             ):
                 try:
                     conn.execute(ddl)
@@ -813,6 +815,7 @@ def init_db():
                 ("alpn", "ALTER TABLE links ADD COLUMN alpn TEXT DEFAULT ''"),
                 ("port", "ALTER TABLE links ADD COLUMN port INTEGER DEFAULT 443"),
                 ("variants_json", "ALTER TABLE links ADD COLUMN variants_json TEXT DEFAULT ''"),
+                ("use_warp", "ALTER TABLE links ADD COLUMN use_warp INTEGER DEFAULT 0"),
             ):
                 if col not in existing_cols:
                     conn.execute(ddl)
@@ -892,20 +895,20 @@ async def save_db():
                     variants = sanitize_variants(link.get("variants"))
                     legacy_protocol, legacy_fp, legacy_alpn = variants_to_legacy(variants)
                     db_execute(conn, """
-                        INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, protocol, fingerprint, alpn, port, variants_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, protocol, fingerprint, alpn, port, variants_json, use_warp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (uid, link["label"], link["limit_bytes"], link["used_bytes"],
                           link.get("max_connections", 0), link["created_at"],
                           1 if link.get("active", True) else 0, link.get("expires_at"),
                           legacy_protocol, legacy_fp, legacy_alpn, link.get("port", DEFAULT_PORT),
-                          json.dumps(variants)))
+                          json.dumps(variants), 1 if link.get("use_warp") else 0))
             # Save addresses
             async with CUSTOM_ADDRESSES_LOCK:
                 db_execute(conn, "DELETE FROM custom_addresses")
                 for addr in CUSTOM_ADDRESSES:
                     db_execute(conn, "INSERT INTO custom_addresses (address) VALUES (?)", (addr,))
             # Save settings
-            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections"):
+            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections", "warp_enabled"):
                 db_execute(conn, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, CONFIG.get(key, "")))
             conn.commit()
     except Exception as e:
@@ -947,6 +950,7 @@ def load_db():
                 "expires_at": row["expires_at"],
                 "variants": variants,
                 "port": row["port"] if row["port"] else DEFAULT_PORT,
+                "use_warp": bool(row["use_warp"]) if "use_warp" in keys else False,
             }
         # Load addresses
         CUSTOM_ADDRESSES.clear()
@@ -1048,11 +1052,21 @@ async def startup():
     await restart_telegram_bot()
     asyncio.create_task(telegram_notifier_cron())
     await ensure_default_link()
+    try:
+        from warp_manager import bootstrap_from_settings
+        await bootstrap_from_settings(CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True))
+    except Exception as e:
+        logger.warning(f"WARP bootstrap skipped: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
     await _stop_telegram_bot()
     await clear_expired_sessions()
+    try:
+        from warp_manager import stop_warp
+        await stop_warp()
+    except Exception:
+        pass
     if http_client:
         await http_client.aclose()
 
@@ -1781,8 +1795,27 @@ async def get_settings(_=Depends(require_auth)):
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "railway_token": CONFIG.get("railway_token", ""),
         "notify_connections": CONFIG.get("notify_connections", "0") in ("1", "true", "True", True),
+        "warp_enabled": CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True),
         "using_neon": USE_POSTGRES,
     }
+
+@app.get("/api/warp/status")
+async def api_warp_status(_=Depends(require_auth)):
+    try:
+        from warp_manager import get_status
+        return get_status()
+    except Exception as e:
+        return {"enabled": False, "running": False, "socks_ok": False, "last_error": str(e)}
+
+@app.post("/api/warp/restart")
+async def api_warp_restart(_=Depends(require_auth)):
+    from warp_manager import restart_warp
+    return await restart_warp()
+
+@app.post("/api/warp/regenerate")
+async def api_warp_regenerate(_=Depends(require_auth)):
+    from warp_manager import regenerate_config
+    return await regenerate_config()
 
 @app.get("/api/setup-status")
 async def api_setup_status(_=Depends(require_auth)):
@@ -1825,8 +1858,19 @@ async def update_settings(request: Request, _=Depends(require_auth)):
         CONFIG["railway_token"] = (body.get("railway_token") or "").strip()
     if "notify_connections" in body:
         CONFIG["notify_connections"] = "1" if body.get("notify_connections") else "0"
+    warp_changed = False
+    if "warp_enabled" in body:
+        new_w = "1" if body.get("warp_enabled") else "0"
+        warp_changed = new_w != str(CONFIG.get("warp_enabled", "0"))
+        CONFIG["warp_enabled"] = new_w
     await save_db()
     await restart_telegram_bot()
+    if warp_changed:
+        try:
+            from warp_manager import set_enabled
+            await set_enabled(CONFIG.get("warp_enabled") == "1")
+        except Exception as e:
+            logger.error(f"WARP toggle error: {e}")
     return {"ok": True}
 
 # ── Railway / Permanent Database ──────────────────────────────────────────
@@ -2059,6 +2103,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
     variants = variants_from_body(body)
     # پورت همیشه 443 است؛ هر مقدار دیگه‌ای که فرانت بفرسته نادیده گرفته می‌شه
     port = DEFAULT_PORT
+    use_warp = bool(body.get("use_warp"))
 
     uid = str(uuid.uuid4())
     async with LINKS_LOCK:
@@ -2072,13 +2117,14 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "expires_at": expires_at,
             "variants": variants,
             "port": port,
+            "use_warp": use_warp,
         }
     await save_db()
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at,
-        "variants": variants, "port": port,
+        "variants": variants, "port": port, "use_warp": use_warp,
         "vless_links": links_for_all_variants(LINKS[uid], uid),
     }
 
@@ -2099,6 +2145,7 @@ async def list_links(_=Depends(require_auth)):
             "expires_at": data.get("expires_at"),
             "variants": sanitize_variants(data.get("variants")),
             "port": data.get("port", DEFAULT_PORT),
+            "use_warp": bool(data.get("use_warp")),
             "current_connections": await count_connections_for_link(uid),
             "vless_links": links_for_all_variants(data, uid),
         })
@@ -2126,6 +2173,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+        if "use_warp" in body:
+            LINKS[uid]["use_warp"] = bool(body["use_warp"])
         variant_keys = ("vless_enabled", "vless_transport", "vless_fingerprint", "vless_alpn",
                         "trojan_enabled", "trojan_transport", "trojan_fingerprint", "trojan_alpn")
         if any(k in body for k in variant_keys):
@@ -3210,6 +3259,21 @@ async def subscription_endpoint(uid: str, request: Request):
 
 RELAY_BUF = 128 * 1024
 
+async def open_backend(address: str, port: int, *, use_warp: bool = False, timeout: float = 10.0):
+    """Open TCP to target. Direct path is unchanged; WARP only when use_warp=True."""
+    if not use_warp:
+        return await asyncio.wait_for(asyncio.open_connection(address, port), timeout=timeout)
+    try:
+        from warp_manager import open_socks_connection, get_status as warp_status
+    except Exception as e:
+        raise OSError(f"WARP module unavailable: {e}") from e
+    st = warp_status()
+    if not st.get("enabled"):
+        raise OSError("WARP exit requested but WARP process is disabled in Settings")
+    if not st.get("running"):
+        raise OSError("WARP exit requested but WARP process is not running")
+    return await open_socks_connection(address, port, timeout=timeout)
+
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
         raise ValueError("chunk too small")
@@ -3479,9 +3543,8 @@ async def websocket_tunnel(websocket: WebSocket, auth: str, uuid: str):
         hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += size
         daily_traffic[now.strftime("%Y-%m-%d")] += size
 
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=10.0
-        )
+        use_warp = bool(link_data_copy.get("use_warp"))
+        reader, writer = await open_backend(address, port, use_warp=use_warp, timeout=10.0)
         # Disable Nagle's algorithm on the backend TCP socket. Without this,
         # small proxied packets (the common case for interactive/streaming
         # traffic) can sit buffered for up to ~40ms waiting to be coalesced,
@@ -4031,6 +4094,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">-</div></div>
         <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">-</div></div>
         <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">-</div></div>
+        <div class="stat-card" style="animation-delay:.40s"><div class="stat-label">WARP</div><div class="stat-val" id="sv-warp" style="font-size:13px">-</div><div class="stat-label" id="sv-warp-sub" style="margin-top:6px;font-size:11px;opacity:.7"></div></div>
       </div>
       <div class="grid-2">
         <div class="card">
@@ -4209,7 +4273,22 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         </div>
         <button class="btn btn-gold" onclick="saveAllSettings()" style="margin-top:10px;width:100%;justify-content:center" data-en="Save All Settings" data-fa="ذخیره همه تنظیمات">Save All Settings</button>
       </div>
-    </section>
+    
+        <div class="card" style="margin-top:16px">
+          <div style="font-weight:600;margin-bottom:10px" data-en="Cloudflare WARP exit" data-fa="خروجی WARP">Cloudflare WARP exit</div>
+          <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Optional userspace WARP→SOCKS exit. Direct inbounds are unchanged. Requires outbound UDP to Cloudflare." data-fa="خروجی اختیاری WARP. اینباندهای مستقیم تغییری نمی‌کنند.">Optional userspace WARP→SOCKS exit. Direct inbounds are unchanged. Requires outbound UDP to Cloudflare.</div>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer">
+            <input type="checkbox" id="warp-enabled-cb">
+            <span data-en="Enable WARP process" data-fa="فعال‌سازی WARP">Enable WARP process</span>
+          </label>
+          <div id="warp-status-line" style="font-size:12px;margin-bottom:10px;color:var(--text2)">Status: —</div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px">
+            <button type="button" class="btn btn-ghost" onclick="saveWarpEnabled()" data-en="Save toggle" data-fa="ذخیره">Save toggle</button>
+            <button type="button" class="btn btn-ghost" onclick="warpRestart()" data-en="Reboot WARP" data-fa="ری‌استارت">Reboot WARP</button>
+            <button type="button" class="btn btn-ghost" onclick="warpRegenerate()" data-en="Regenerate config" data-fa="ساخت مجدد کانفیگ">Regenerate config</button>
+          </div>
+        </div>
+</section>
 
   </main>
 </div>
@@ -4296,6 +4375,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <label class="fl" data-en="Port" data-fa="پورت">Port</label>
       <input class="fi" value="443" readonly style="cursor:not-allowed">
     </div>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;cursor:pointer">
+      <input type="checkbox" id="n-use-warp">
+      <span data-en="Use WARP exit (off = direct)" data-fa="خروجی WARP (خاموش = مستقیم)">Use WARP exit (off = direct)</span>
+    </label>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
@@ -4311,6 +4394,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
+    <label style="display:flex;align-items:center;gap:8px;margin:8px 0;font-size:13px;cursor:pointer">
+      <input type="checkbox" id="e-use-warp">
+      <span data-en="Use WARP exit" data-fa="خروجی WARP">Use WARP exit</span>
+    </label>
     <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = no change"></div>
     <div class="fg" style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:4px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
@@ -4533,6 +4620,8 @@ function showDashboard(){
   loadLinks();
   loadAddrs();
   loadSettings();
+  refreshWarpStatus();
+  setInterval(refreshWarpStatus, 30000);
   loadNotifs();
   updateNotifBadge();
   connectLogsWS();
@@ -4820,7 +4909,7 @@ async function createLink(){
   const v=parseFloat($m('nv').value)||0;
   const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
-  const body=Object.assign({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days},readVariantFields('n','vless'),readVariantFields('n','trojan'));
+  const body=Object.assign({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days,use_warp:!!($m('n-use-warp')&&$m('n-use-warp').checked)},readVariantFields('n','vless'),readVariantFields('n','trojan'));
   try{
     const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok)throw new Error();
@@ -4839,6 +4928,7 @@ function showEditMo(uid){
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
+  if($m('e-use-warp'))$m('e-use-warp').checked=!!l.use_warp;
   const variants=l.variants||{};
   fillVariantFields('e','vless',variants.vless);
   fillVariantFields('e','trojan',variants.trojan);
@@ -4852,7 +4942,7 @@ async function saveEdit(){
   const v=parseFloat($m('el').value)||0;
   const mc=parseInt($m('ec').value)||0;
   const days=parseInt($m('ed').value)||0;
-  const body=Object.assign({limit_value:v,limit_unit:'GB',max_connections:mc},readVariantFields('e','vless'),readVariantFields('e','trojan'));
+  const body=Object.assign({limit_value:v,limit_unit:'GB',max_connections:mc,use_warp:!!($m('e-use-warp')&&$m('e-use-warp').checked)},readVariantFields('e','vless'),readVariantFields('e','trojan'));
   if(days>0)body.days_valid=days;
   try{
     const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -4903,6 +4993,44 @@ function dlQR(){
   a.href=$m('qr-img').src;a.download='luffy-qr.png';a.click();
 }
 
+
+async function refreshWarpStatus(){
+  try{
+    const r=await fetch('/api/warp/status');
+    const d=await r.json();
+    const el=$m('sv-warp');
+    const sub=$m('sv-warp-sub');
+    if(el){
+      if(!d.enabled){el.textContent='Off';el.style.color='var(--text3)';}
+      else if(d.socks_ok){el.textContent='OK';el.style.color='var(--green)';}
+      else if(d.running){el.textContent='Starting…';el.style.color='var(--yellow)';}
+      else {el.textContent='Down';el.style.color='var(--red)';}
+    }
+    if(sub) sub.textContent=d.last_error?String(d.last_error).slice(0,80):(d.socks||'');
+    const line=$m('warp-status-line');
+    if(line){
+      line.textContent='Status: '+(d.enabled?'enabled':'disabled')+' | running='+!!d.running+' | socks_ok='+!!d.socks_ok+(d.last_error?' | '+d.last_error:'');
+    }
+    const cb=$m('warp-enabled-cb');
+    if(cb && document.activeElement!==cb) cb.checked=!!d.enabled;
+  }catch(e){}
+}
+async function saveWarpEnabled(){
+  const on=!!($m('warp-enabled-cb')&&$m('warp-enabled-cb').checked);
+  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warp_enabled:on})});
+  setTimeout(refreshWarpStatus,800);
+  alert(on?'WARP enable requested':'WARP disabled');
+}
+async function warpRestart(){
+  await fetch('/api/warp/restart',{method:'POST'});
+  setTimeout(refreshWarpStatus,1000);
+}
+async function warpRegenerate(){
+  if(!confirm('Regenerate WARP account/config and restart?'))return;
+  await fetch('/api/warp/regenerate',{method:'POST'});
+  setTimeout(refreshWarpStatus,1500);
+}
+
 async function loadSettings(){
   try{
     const r=await fetch('/api/settings');
@@ -4913,6 +5041,7 @@ async function loadSettings(){
       if($m('rw-tg-admin'))$m('rw-tg-admin').value=d.telegram_admin_id||'';
       if($m('rw-token'))$m('rw-token').value=d.railway_token||'';
       if($m('rw-tg-notify-conn'))$m('rw-tg-notify-conn').checked=!!d.notify_connections;
+      if($m('warp-enabled-cb'))$m('warp-enabled-cb').checked=!!d.warp_enabled;
     }
   }catch(e){}
 }

@@ -211,9 +211,12 @@ async def _pump_tcp_to_queue(session_id: str, uid: str, reader: asyncio.StreamRe
 async def _open_tcp_for_session(session_id: str, uid: str, sess: dict, first_chunk: bytes):
     auth = sess.get("auth", "vless")
     command, address, port, payload = await parse_proxy_header(auth, first_chunk)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
-    )
+    use_warp = False
+    async with LINKS_LOCK:
+        link = LINKS.get(uid) or {}
+        use_warp = bool(link.get("use_warp"))
+    from main import open_backend
+    reader, writer = await open_backend(address, port, use_warp=use_warp, timeout=TCP_CONNECT_TIMEOUT)
     _tune_socket(writer)
     if payload:
         writer.write(payload)
