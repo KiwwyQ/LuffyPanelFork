@@ -3259,20 +3259,153 @@ async def subscription_endpoint(uid: str, request: Request):
 
 RELAY_BUF = 128 * 1024
 
+# VLESS: 1=TCP 2=UDP. Trojan (SOCKS-like): 1=TCP 3=UDP ASSOCIATE.
+CMD_TCP = 0x01
+CMD_UDP_VLESS = 0x02
+CMD_UDP_TROJAN = 0x03
+
+def _is_udp_command(command: int) -> bool:
+    return command in (CMD_UDP_VLESS, CMD_UDP_TROJAN)
+
 async def open_backend(address: str, port: int, *, use_warp: bool = False, timeout: float = 10.0):
     """Open TCP to target. Direct path is unchanged; WARP only when use_warp=True."""
     if not use_warp:
         return await asyncio.wait_for(asyncio.open_connection(address, port), timeout=timeout)
     try:
-        from warp_manager import open_socks_connection, get_status as warp_status
+        from warp_manager import open_socks_connection
     except Exception as e:
         raise OSError(f"WARP module unavailable: {e}") from e
-    st = warp_status()
-    if not st.get("enabled"):
-        raise OSError("WARP exit requested but WARP process is disabled in Settings")
-    if not st.get("running"):
-        raise OSError("WARP exit requested but WARP process is not running")
     return await open_socks_connection(address, port, timeout=timeout)
+
+
+async def _udp_relay_ws(
+    websocket,
+    address: str,
+    port: int,
+    initial_payload: bytes,
+    *,
+    use_warp: bool,
+    conn_id: str,
+    link_uid: str,
+    resp_prefix: bytes,
+):
+    """
+    Relay VLESS/Trojan UDP over the existing WebSocket.
+    - Direct: OS UDP socket to target
+    - WARP: SOCKS5 UDP ASSOCIATE via local sing-box
+    Framing: each WS binary message is one UDP datagram payload (simple mode).
+    First downstream packet is prefixed with resp_prefix for VLESS.
+    """
+    transport = None
+    protocol = None
+    socks_sess = None
+    first_down = True
+
+    class _Proto(asyncio.DatagramProtocol):
+        def __init__(self):
+            self.q: asyncio.Queue = asyncio.Queue()
+
+        def datagram_received(self, data, addr):
+            try:
+                self.q.put_nowait(data)
+            except Exception:
+                pass
+
+    async def send_udp(payload: bytes):
+        if use_warp:
+            await socks_sess.send(payload)
+        else:
+            transport.sendto(payload, (address, port))
+
+    async def recv_udp():
+        if use_warp:
+            return await socks_sess.recv(timeout=120.0)
+        return await asyncio.wait_for(protocol.q.get(), timeout=120.0)
+
+    try:
+        if use_warp:
+            from warp_manager import SocksUdpSession
+            socks_sess = SocksUdpSession(address, port)
+            await socks_sess.start(timeout=10.0)
+        else:
+            loop = asyncio.get_running_loop()
+            protocol = _Proto()
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: protocol, local_addr=("0.0.0.0", 0)
+            )
+
+        if initial_payload:
+            if not await check_and_add_usage(link_uid, len(initial_payload)):
+                await websocket.close(code=1008, reason="quota exceeded")
+                return
+            stats["total_bytes"] += len(initial_payload)
+            async with connections_lock:
+                if conn_id in connections:
+                    connections[conn_id]["bytes"] += len(initial_payload)
+            await send_udp(initial_payload)
+
+        async def up():
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        break
+                    data = msg.get("bytes") or (msg.get("text") or "").encode()
+                    if not data:
+                        continue
+                    if not await check_and_add_usage(link_uid, len(data)):
+                        await websocket.close(code=1008, reason="quota exceeded")
+                        break
+                    stats["total_bytes"] += len(data)
+                    async with connections_lock:
+                        if conn_id in connections:
+                            connections[conn_id]["bytes"] += len(data)
+                    await send_udp(data)
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
+
+        async def down():
+            nonlocal first_down
+            try:
+                while True:
+                    data = await recv_udp()
+                    if not data:
+                        continue
+                    if not await check_and_add_usage(link_uid, len(data)):
+                        await websocket.close(code=1008, reason="quota exceeded")
+                        break
+                    stats["total_bytes"] += len(data)
+                    async with connections_lock:
+                        if conn_id in connections:
+                            connections[conn_id]["bytes"] += len(data)
+                    out = (resp_prefix + data) if (first_down and resp_prefix) else data
+                    first_down = False
+                    await websocket.send_bytes(out)
+            except Exception:
+                pass
+
+        t_up = asyncio.create_task(up())
+        t_down = asyncio.create_task(down())
+        done, pending = await asyncio.wait({t_up, t_down}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+    finally:
+        if transport:
+            try:
+                transport.close()
+            except Exception:
+                pass
+        if socks_sess:
+            try:
+                await socks_sess.close()
+            except Exception:
+                pass
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
@@ -3544,46 +3677,55 @@ async def websocket_tunnel(websocket: WebSocket, auth: str, uuid: str):
         daily_traffic[now.strftime("%Y-%m-%d")] += size
 
         use_warp = bool(link_data_copy.get("use_warp"))
-        reader, writer = await open_backend(address, port, use_warp=use_warp, timeout=10.0)
-        # Disable Nagle's algorithm on the backend TCP socket. Without this,
-        # small proxied packets (the common case for interactive/streaming
-        # traffic) can sit buffered for up to ~40ms waiting to be coalesced,
-        # which is felt as real added latency/slowness on every config.
-        try:
-            backend_sock = writer.get_extra_info("socket")
-            if backend_sock is not None:
-                backend_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except (OSError, AttributeError):
-            pass
-
-        if initial_payload and not await check_and_add_usage(uuid, len(initial_payload)):
-            await websocket.close(code=1008, reason="quota exceeded")
-            return
-
-        if initial_payload:
-            p_size = len(initial_payload)
-            stats["total_bytes"] += p_size
-            async with connections_lock:
-                if conn_id in connections:
-                    connections[conn_id]["bytes"] += p_size
-            now = datetime.now(timezone.utc)
-            hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += p_size
-            daily_traffic[now.strftime("%Y-%m-%d")] += p_size
+        # UDP command → dedicated relay (direct socket or SOCKS ASSOCIATE).
+        # TCP (default) keeps the previous open_backend + stream relay path.
+        if _is_udp_command(command):
+            await _udp_relay_ws(
+                websocket, address, port, initial_payload,
+                use_warp=use_warp, conn_id=conn_id, link_uid=uuid,
+                resp_prefix=response_prefix_for_protocol(auth),
+            )
+        else:
+            reader, writer = await open_backend(address, port, use_warp=use_warp, timeout=10.0)
+            # Disable Nagle's algorithm on the backend TCP socket. Without this,
+            # small proxied packets (the common case for interactive/streaming
+            # traffic) can sit buffered for up to ~40ms waiting to be coalesced,
+            # which is felt as real added latency/slowness on every config.
             try:
-                writer.write(initial_payload)
-                await writer.drain()
-            except Exception:
+                backend_sock = writer.get_extra_info("socket")
+                if backend_sock is not None:
+                    backend_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except (OSError, AttributeError):
                 pass
 
-        task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, resp_prefix=response_prefix_for_protocol(auth)))
-        done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+            if initial_payload and not await check_and_add_usage(uuid, len(initial_payload)):
+                await websocket.close(code=1008, reason="quota exceeded")
+                return
+
+            if initial_payload:
+                p_size = len(initial_payload)
+                stats["total_bytes"] += p_size
+                async with connections_lock:
+                    if conn_id in connections:
+                        connections[conn_id]["bytes"] += p_size
+                now = datetime.now(timezone.utc)
+                hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += p_size
+                daily_traffic[now.strftime("%Y-%m-%d")] += p_size
+                try:
+                    writer.write(initial_payload)
+                    await writer.drain()
+                except Exception:
+                    pass
+
+            task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
+            task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, resp_prefix=response_prefix_for_protocol(auth)))
+            done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
     except WebSocketDisconnect:
         pass
@@ -4278,12 +4420,12 @@ body[dir="rtl"]{direction:rtl;text-align:right}
           <div style="font-weight:600;margin-bottom:10px" data-en="Cloudflare WARP exit" data-fa="خروجی WARP">Cloudflare WARP exit</div>
           <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Optional userspace WARP→SOCKS exit. Direct inbounds are unchanged. Requires outbound UDP to Cloudflare." data-fa="خروجی اختیاری WARP. اینباندهای مستقیم تغییری نمی‌کنند.">Optional userspace WARP→SOCKS exit. Direct inbounds are unchanged. Requires outbound UDP to Cloudflare.</div>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer">
-            <input type="checkbox" id="warp-enabled-cb">
+            <input type="checkbox" id="warp-enabled-cb" onchange="saveWarpEnabled()">
             <span data-en="Enable WARP process" data-fa="فعال‌سازی WARP">Enable WARP process</span>
           </label>
+          <div style="font-size:11px;color:var(--text3);margin-bottom:8px" data-en="Saves and starts/stops immediately when toggled." data-fa="با تغییر فوراً ذخیره و اجرا می‌شود.">Saves and starts/stops immediately when toggled.</div>
           <div id="warp-status-line" style="font-size:12px;margin-bottom:10px;color:var(--text2)">Status: —</div>
           <div style="display:flex;flex-wrap:wrap;gap:8px">
-            <button type="button" class="btn btn-ghost" onclick="saveWarpEnabled()" data-en="Save toggle" data-fa="ذخیره">Save toggle</button>
             <button type="button" class="btn btn-ghost" onclick="warpRestart()" data-en="Reboot WARP" data-fa="ری‌استارت">Reboot WARP</button>
             <button type="button" class="btn btn-ghost" onclick="warpRegenerate()" data-en="Regenerate config" data-fa="ساخت مجدد کانفیگ">Regenerate config</button>
           </div>
@@ -5017,9 +5159,16 @@ async function refreshWarpStatus(){
 }
 async function saveWarpEnabled(){
   const on=!!($m('warp-enabled-cb')&&$m('warp-enabled-cb').checked);
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warp_enabled:on})});
-  setTimeout(refreshWarpStatus,800);
-  alert(on?'WARP enable requested':'WARP disabled');
+  const cb=$m('warp-enabled-cb');
+  if(cb) cb.disabled=true;
+  try{
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warp_enabled:on})});
+    setTimeout(refreshWarpStatus,1000);
+  }catch(e){
+    if(cb) cb.checked=!on;
+  }finally{
+    if(cb) cb.disabled=false;
+  }
 }
 async function warpRestart(){
   await fetch('/api/warp/restart',{method:'POST'});
