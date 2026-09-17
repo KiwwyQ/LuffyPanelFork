@@ -219,6 +219,8 @@ CONFIG = {
     "railway_token": "",
     "notify_connections": "0",
     "warp_enabled": "0",
+    "warp_mtu": "1280",
+    "warp_ipv4_only": "0",
 }
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -908,7 +910,7 @@ async def save_db():
                 for addr in CUSTOM_ADDRESSES:
                     db_execute(conn, "INSERT INTO custom_addresses (address) VALUES (?)", (addr,))
             # Save settings
-            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections", "warp_enabled"):
+            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections", "warp_enabled", "warp_mtu", "warp_ipv4_only"):
                 db_execute(conn, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, CONFIG.get(key, "")))
             conn.commit()
     except Exception as e:
@@ -1054,7 +1056,16 @@ async def startup():
     await ensure_default_link()
     try:
         from warp_manager import bootstrap_from_settings
-        await bootstrap_from_settings(CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True))
+        try:
+            from warp_manager import set_options_memory, bootstrap_from_settings as _warp_boot
+            set_options_memory(
+                mtu=int(CONFIG.get("warp_mtu") or 1280),
+                ipv4_only=CONFIG.get("warp_ipv4_only", "0") in ("1", "true", "True", True),
+            )
+            await _warp_boot(CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True))
+        except Exception:
+            from warp_manager import bootstrap_from_settings
+            await bootstrap_from_settings(CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True))
     except Exception as e:
         logger.warning(f"WARP bootstrap skipped: {e}")
 
@@ -1796,6 +1807,8 @@ async def get_settings(_=Depends(require_auth)):
         "railway_token": CONFIG.get("railway_token", ""),
         "notify_connections": CONFIG.get("notify_connections", "0") in ("1", "true", "True", True),
         "warp_enabled": CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True),
+        "warp_mtu": int(CONFIG.get("warp_mtu") or 1280),
+        "warp_ipv4_only": CONFIG.get("warp_ipv4_only", "0") in ("1", "true", "True", True),
         "using_neon": USE_POSTGRES,
     }
 
@@ -1859,18 +1872,47 @@ async def update_settings(request: Request, _=Depends(require_auth)):
     if "notify_connections" in body:
         CONFIG["notify_connections"] = "1" if body.get("notify_connections") else "0"
     warp_changed = False
+    tunables_changed = False
     if "warp_enabled" in body:
         new_w = "1" if body.get("warp_enabled") else "0"
         warp_changed = new_w != str(CONFIG.get("warp_enabled", "0"))
         CONFIG["warp_enabled"] = new_w
+    if "warp_mtu" in body:
+        try:
+            mtu = int(body.get("warp_mtu") or 1280)
+        except (TypeError, ValueError):
+            mtu = 1280
+        mtu = max(576, min(1500, mtu))
+        if str(mtu) != str(CONFIG.get("warp_mtu", "1280")):
+            tunables_changed = True
+        CONFIG["warp_mtu"] = str(mtu)
+    if "warp_ipv4_only" in body:
+        new_v4 = "1" if body.get("warp_ipv4_only") else "0"
+        if new_v4 != str(CONFIG.get("warp_ipv4_only", "0")):
+            tunables_changed = True
+        CONFIG["warp_ipv4_only"] = new_v4
     await save_db()
     await restart_telegram_bot()
     if warp_changed:
         try:
-            from warp_manager import set_enabled
+            from warp_manager import set_enabled, set_options_memory
+            set_options_memory(
+                mtu=int(CONFIG.get("warp_mtu") or 1280),
+                ipv4_only=CONFIG.get("warp_ipv4_only") == "1",
+            )
             await set_enabled(CONFIG.get("warp_enabled") == "1")
         except Exception as e:
             logger.error(f"WARP toggle error: {e}")
+    elif tunables_changed:
+        try:
+            from warp_manager import apply_tunables
+            await apply_tunables(
+                mtu=int(CONFIG.get("warp_mtu") or 1280),
+                ipv4_only=CONFIG.get("warp_ipv4_only") == "1",
+                restart=True,
+            )
+        except Exception as e:
+            logger.error(f"WARP tunables error: {e}")
     return {"ok": True}
 
 # ── Railway / Permanent Database ──────────────────────────────────────────
@@ -4424,6 +4466,16 @@ body[dir="rtl"]{direction:rtl;text-align:right}
             <span data-en="Enable WARP process" data-fa="فعال‌سازی WARP">Enable WARP process</span>
           </label>
           <div style="font-size:11px;color:var(--text3);margin-bottom:8px" data-en="Saves and starts/stops immediately when toggled." data-fa="با تغییر فوراً ذخیره و اجرا می‌شود.">Saves and starts/stops immediately when toggled.</div>
+          <div class="fg" style="margin-bottom:10px">
+            <label class="fl" data-en="WARP MTU (576–1500)" data-fa="MTU">WARP MTU (576–1500)</label>
+            <input class="fi" type="number" id="warp-mtu-in" min="576" max="1500" step="10" value="1280" style="max-width:140px">
+            <div style="font-size:11px;color:var(--text3);margin-top:4px" data-en="Lower if HTTPS stalls (try 1200 or 1100). Applied on Save tunables + restart." data-fa="اگر HTTPS گیر کرد کمتر کنید.">Lower if HTTPS stalls (try 1200 or 1100). Applied on Save tunables + restart.</div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer">
+            <input type="checkbox" id="warp-ipv4-only-cb">
+            <span data-en="IPv4 only (omit WARP IPv6 address)" data-fa="فقط IPv4">IPv4 only (omit WARP IPv6 address)</span>
+          </label>
+          <button type="button" class="btn btn-gold" onclick="saveWarpTunables()" style="margin-bottom:12px;width:100%;justify-content:center" data-en="Save MTU / IPv4 + restart WARP" data-fa="ذخیره MTU و ری‌استارت">Save MTU / IPv4 + restart WARP</button>
           <div id="warp-status-line" style="font-size:12px;margin-bottom:10px;color:var(--text2)">Status: —</div>
           <div style="display:flex;flex-wrap:wrap;gap:8px">
             <button type="button" class="btn btn-ghost" onclick="warpRestart()" data-en="Reboot WARP" data-fa="ری‌استارت">Reboot WARP</button>
@@ -5170,6 +5222,16 @@ async function saveWarpEnabled(){
     if(cb) cb.disabled=false;
   }
 }
+async function saveWarpTunables(){
+  let mtu=parseInt(($m('warp-mtu-in')&&$m('warp-mtu-in').value)||'1280',10);
+  if(isNaN(mtu)) mtu=1280;
+  const ipv4=!!($m('warp-ipv4-only-cb')&&$m('warp-ipv4-only-cb').checked);
+  try{
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warp_mtu:mtu,warp_ipv4_only:ipv4})});
+    toast('WARP tunables saved — process restarted if running');
+    setTimeout(refreshWarpStatus,1500);
+  }catch(e){toast('Failed to save tunables',true)}
+}
 async function warpRestart(){
   await fetch('/api/warp/restart',{method:'POST'});
   setTimeout(refreshWarpStatus,1000);
@@ -5191,6 +5253,8 @@ async function loadSettings(){
       if($m('rw-token'))$m('rw-token').value=d.railway_token||'';
       if($m('rw-tg-notify-conn'))$m('rw-tg-notify-conn').checked=!!d.notify_connections;
       if($m('warp-enabled-cb'))$m('warp-enabled-cb').checked=!!d.warp_enabled;
+      if($m('warp-mtu-in')&&d.warp_mtu!=null)$m('warp-mtu-in').value=d.warp_mtu;
+      if($m('warp-ipv4-only-cb'))$m('warp-ipv4-only-cb').checked=!!d.warp_ipv4_only;
     }
   }catch(e){}
 }

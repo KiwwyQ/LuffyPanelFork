@@ -136,17 +136,56 @@ def _http_json(method: str, url: str, body: dict | None = None, token: str | Non
         return json.loads(raw) if raw else {}
 
 
-def _write_singbox_config(private_key: str, v4: str, v6: str, peer_pub: str,
-                          endpoint_host: str, endpoint_port: int, reserved: list | None = None) -> None:
+# Runtime tunables (panel settings → rewrite config + restart). Defaults match WARP practice.
+_options: dict[str, Any] = {
+    "mtu": 1280,
+    "ipv4_only": False,
+}
+
+
+def get_options() -> dict:
+    return {"mtu": int(_options.get("mtu") or 1280), "ipv4_only": bool(_options.get("ipv4_only"))}
+
+
+def set_options_memory(mtu: int | None = None, ipv4_only: bool | None = None) -> dict:
+    if mtu is not None:
+        mtu = int(mtu)
+        if mtu < 576:
+            mtu = 576
+        if mtu > 1500:
+            mtu = 1500
+        _options["mtu"] = mtu
+    if ipv4_only is not None:
+        _options["ipv4_only"] = bool(ipv4_only)
+    return get_options()
+
+
+def _write_singbox_config(
+    private_key: str,
+    v4: str,
+    v6: str,
+    peer_pub: str,
+    endpoint_host: str,
+    endpoint_port: int,
+    reserved: list | None = None,
+    mtu: int | None = None,
+    ipv4_only: bool | None = None,
+) -> None:
     """sing-box 1.11+: wireguard as endpoint, socks inbound routes to it."""
+    if mtu is None:
+        mtu = int(_options.get("mtu") or 1280)
+    if ipv4_only is None:
+        ipv4_only = bool(_options.get("ipv4_only"))
+    mtu = max(576, min(1500, int(mtu)))
+
     addresses = [f"{v4}/32"]
-    if v6:
+    if v6 and not ipv4_only:
         addresses.append(f"{v6}/128")
     peer: dict[str, Any] = {
         "address": endpoint_host,
         "port": int(endpoint_port),
         "public_key": peer_pub,
-        "allowed_ips": ["0.0.0.0/0", "::/0"],
+        "allowed_ips": ["0.0.0.0/0"] if ipv4_only else ["0.0.0.0/0", "::/0"],
         "persistent_keepalive_interval": 25,
     }
     if reserved and len(reserved) == 3:
@@ -168,7 +207,7 @@ def _write_singbox_config(private_key: str, v4: str, v6: str, peer_pub: str,
                 "type": "wireguard",
                 "tag": "wg-warp",
                 "system": False,
-                "mtu": 1280,
+                "mtu": mtu,
                 "address": addresses,
                 "private_key": private_key,
                 "peers": [peer],
@@ -187,11 +226,58 @@ def _write_singbox_config(private_key: str, v4: str, v6: str, peer_pub: str,
     SINGBOX_JSON.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     WG_CONF.write_text(
         f"[Interface]\nPrivateKey = {private_key}\nAddress = {', '.join(addresses)}\n"
-        f"DNS = 1.1.1.1\nMTU = 1280\n\n[Peer]\nPublicKey = {peer_pub}\n"
-        f"Endpoint = {endpoint_host}:{endpoint_port}\nAllowedIPs = 0.0.0.0/0, ::/0\n"
+        f"DNS = 1.1.1.1\nMTU = {mtu}\n\n[Peer]\nPublicKey = {peer_pub}\n"
+        f"Endpoint = {endpoint_host}:{endpoint_port}\n"
+        f"AllowedIPs = {'0.0.0.0/0' if ipv4_only else '0.0.0.0/0, ::/0'}\n"
         f"PersistentKeepalive = 25\n",
         encoding="utf-8",
     )
+
+
+def rewrite_config_from_existing(mtu: int | None = None, ipv4_only: bool | None = None) -> dict:
+    """
+    Apply tunables without re-registering with Cloudflare.
+    Reads private_key / peer from current sing-box.json (or fails if missing).
+    """
+    set_options_memory(mtu=mtu, ipv4_only=ipv4_only)
+    if not SINGBOX_JSON.is_file():
+        raise RuntimeError("No WARP config yet — enable WARP or Regenerate first")
+    cfg = json.loads(SINGBOX_JSON.read_text(encoding="utf-8"))
+    eps = cfg.get("endpoints") or []
+    if not eps:
+        raise RuntimeError("sing-box.json has no wireguard endpoint")
+    ep = eps[0]
+    private_key = ep.get("private_key") or ""
+    peers = ep.get("peers") or []
+    if not private_key or not peers:
+        raise RuntimeError("sing-box.json incomplete")
+    peer = peers[0]
+    peer_pub = peer.get("public_key") or WARP_PEER_PUBLIC_KEY
+    endpoint_host = peer.get("address") or WARP_ENDPOINT_HOST
+    endpoint_port = int(peer.get("port") or WARP_ENDPOINT_PORT)
+    reserved = peer.get("reserved")
+
+    v4, v6 = "172.16.0.2", ""
+    if ACCOUNT_JSON.is_file():
+        try:
+            acc = json.loads(ACCOUNT_JSON.read_text(encoding="utf-8"))
+            v4 = acc.get("v4") or v4
+            v6 = acc.get("v6") or ""
+        except Exception:
+            pass
+    # Fallback: parse existing addresses
+    for a in ep.get("address") or []:
+        if ":" in str(a) and not v6:
+            v6 = str(a).split("/")[0]
+        elif "." in str(a):
+            v4 = str(a).split("/")[0]
+
+    _write_singbox_config(
+        private_key, v4, v6, peer_pub, endpoint_host, endpoint_port, reserved,
+        mtu=int(_options["mtu"]), ipv4_only=bool(_options["ipv4_only"]),
+    )
+    _state["config_ready"] = True
+    return get_options()
 
 
 def register_warp_account(force: bool = False) -> dict:
@@ -681,6 +767,35 @@ async def set_enabled(enabled: bool) -> dict:
     if enabled:
         return await start_warp()
     return await stop_warp()
+
+
+async def apply_tunables(mtu: int | None = None, ipv4_only: bool | None = None, restart: bool = True) -> dict:
+    """Update MTU / IPv4-only, rewrite config, optionally restart if WARP was enabled."""
+    async with _lock:
+        was = bool(_state.get("enabled")) and _proc_alive()
+        try:
+            await asyncio.to_thread(rewrite_config_from_existing, mtu, ipv4_only)
+            _state["last_error"] = ""
+        except Exception as e:
+            _state["last_error"] = f"tunables: {e}"
+            return {**get_status(), **get_options()}
+        if restart and was:
+            try:
+                await asyncio.to_thread(_start_proc)
+                await asyncio.sleep(1.5)
+                ok = await socks_health_ok()
+                _state["socks_ok"] = ok
+                _state["enabled"] = True
+                _state["restarts"] = int(_state.get("restarts") or 0) + 1
+                if ok:
+                    _state["last_ok_at"] = time.time()
+                    _state["fail_streak"] = 0
+                else:
+                    _state["last_error"] = "config applied; health check failed"
+            except Exception as e:
+                _state["last_error"] = str(e)
+                _state["running"] = False
+        return {**get_status(), **get_options()}
 
 
 async def _health_loop():
