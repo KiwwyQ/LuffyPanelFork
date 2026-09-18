@@ -943,12 +943,29 @@ class SocksUdpSession:
         pkt = _socks_udp_header(self.dest_host, self.dest_port, payload)
         self._udp.sendto(pkt, (self.relay_host, self.relay_port))
 
+    async def send_to(self, host: str, port: int, payload: bytes):
+        """Send one datagram to an arbitrary destination (XUDP multi-dest)."""
+        if not self._udp or not self._protocol:
+            raise OSError("UDP session not started")
+        if not payload:
+            return
+        pkt = _socks_udp_header(host, int(port), payload)
+        self._udp.sendto(pkt, (self.relay_host, self.relay_port))
+
     async def recv(self, timeout: float = 30.0) -> bytes:
         if not self._protocol:
             raise OSError("UDP session not started")
         data = await asyncio.wait_for(self._protocol.queue.get(), timeout=timeout)
         _, _, payload = _parse_socks_udp(data)
         return payload
+
+    async def recv_ex(self, timeout: float = 30.0):
+        """Return (src_host, src_port, payload) from a SOCKS UDP reply."""
+        if not self._protocol:
+            raise OSError("UDP session not started")
+        data = await asyncio.wait_for(self._protocol.queue.get(), timeout=timeout)
+        host, port, payload = _parse_socks_udp(data)
+        return host, port, payload
 
     async def close(self):
         try:

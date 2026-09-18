@@ -3362,6 +3362,445 @@ def _encode_length_packet(payload: bytes) -> bytes:
         return b""
     return n.to_bytes(2, "big") + payload
 
+
+# ── Mux.Cool / XUDP (VLESS command 0x03) ───────────────────────────────────
+# Frame: [2B meta_len][meta][optional 2B data_len][data]
+# Meta:  [2B id][1B status][1B opt][... New/Keep fields ...]
+# Status: New=1 Keep=2 End=3 KeepAlive=4
+# Opt: Data=0x01 Error=0x02
+# Network in New: TCP=1 UDP=2
+# XUDP: UDP New includes 8-byte GlobalID; UDP Keep may include addr (no GlobalID).
+
+_MUX_STATUS_NEW = 0x01
+_MUX_STATUS_KEEP = 0x02
+_MUX_STATUS_END = 0x03
+_MUX_STATUS_KEEPALIVE = 0x04
+_MUX_OPT_DATA = 0x01
+_MUX_NET_TCP = 0x01
+_MUX_NET_UDP = 0x02
+_MUX_MAX_META = 512
+_MUX_MAX_DATA = 65535
+
+
+def _mux_encode_addr(host: str, port: int) -> bytes:
+    """Port-first address (Mux / VLESS style)."""
+    p = int(port).to_bytes(2, "big")
+    try:
+        raw = socket.inet_aton(host)
+        return p + b"\x01" + raw
+    except OSError:
+        pass
+    try:
+        raw = socket.inet_pton(socket.AF_INET6, host)
+        return p + b"\x03" + raw
+    except OSError:
+        pass
+    hb = host.encode("utf-8", errors="ignore")[:255]
+    return p + b"\x02" + bytes([len(hb)]) + hb
+
+
+def _mux_parse_addr(buf: bytes, pos: int):
+    """Return (host, port, new_pos) from port-first address at pos."""
+    if pos + 3 > len(buf):
+        raise ValueError("mux addr truncated")
+    port = int.from_bytes(buf[pos:pos + 2], "big")
+    pos += 2
+    atyp = buf[pos]
+    pos += 1
+    if atyp == 1:
+        if pos + 4 > len(buf):
+            raise ValueError("mux ipv4 truncated")
+        host = socket.inet_ntoa(buf[pos:pos + 4])
+        pos += 4
+    elif atyp == 2:
+        if pos >= len(buf):
+            raise ValueError("mux domain len truncated")
+        ln = buf[pos]
+        pos += 1
+        if pos + ln > len(buf):
+            raise ValueError("mux domain truncated")
+        host = buf[pos:pos + ln].decode("utf-8", errors="ignore")
+        pos += ln
+    elif atyp == 3:
+        if pos + 16 > len(buf):
+            raise ValueError("mux ipv6 truncated")
+        host = socket.inet_ntop(socket.AF_INET6, buf[pos:pos + 16])
+        pos += 16
+    else:
+        raise ValueError(f"mux bad atyp {atyp}")
+    return host, port, pos
+
+
+class _MuxFrameDecoder:
+    """Incremental Mux.Cool frame decoder (byte stream over WebSocket)."""
+
+    __slots__ = ("_buf",)
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data: bytes) -> list:
+        if data:
+            self._buf.extend(data)
+        frames = []
+        while True:
+            if len(self._buf) < 2:
+                break
+            meta_len = (self._buf[0] << 8) | self._buf[1]
+            if meta_len < 4 or meta_len > _MUX_MAX_META:
+                # resync one byte
+                del self._buf[0]
+                continue
+            if len(self._buf) < 2 + meta_len:
+                break
+            meta = bytes(self._buf[2:2 + meta_len])
+            pos = 2 + meta_len
+            sid = (meta[0] << 8) | meta[1]
+            status = meta[2]
+            opt = meta[3]
+            rest = meta[4:]
+            payload = b""
+            if opt & _MUX_OPT_DATA:
+                if len(self._buf) < pos + 2:
+                    break
+                dlen = (self._buf[pos] << 8) | self._buf[pos + 1]
+                pos += 2
+                if dlen > _MUX_MAX_DATA:
+                    del self._buf[0]
+                    continue
+                if len(self._buf) < pos + dlen:
+                    break
+                payload = bytes(self._buf[pos:pos + dlen])
+                pos += dlen
+            del self._buf[:pos]
+            frames.append((sid, status, opt, rest, payload))
+        return frames
+
+
+def _mux_build_frame(sid: int, status: int, opt: int, extra_meta: bytes = b"", payload: bytes = b"") -> bytes:
+    meta = sid.to_bytes(2, "big") + bytes([status & 0xFF, opt & 0xFF]) + (extra_meta or b"")
+    if len(meta) > _MUX_MAX_META:
+        meta = meta[:_MUX_MAX_META]
+    out = len(meta).to_bytes(2, "big") + meta
+    if opt & _MUX_OPT_DATA and payload is not None:
+        pl = payload if len(payload) <= _MUX_MAX_DATA else payload[:_MUX_MAX_DATA]
+        out += len(pl).to_bytes(2, "big") + pl
+    return out
+
+
+def _mux_frame_xudp_keep(sid: int, host: str, port: int, payload: bytes) -> bytes:
+    """Downlink UDP packet as XUDP Keep with per-packet address."""
+    extra = bytes([_MUX_NET_UDP]) + _mux_encode_addr(host, port)
+    return _mux_build_frame(sid, _MUX_STATUS_KEEP, _MUX_OPT_DATA, extra, payload)
+
+
+def _mux_frame_tcp_keep(sid: int, payload: bytes) -> bytes:
+    return _mux_build_frame(sid, _MUX_STATUS_KEEP, _MUX_OPT_DATA, b"", payload)
+
+
+def _mux_frame_end(sid: int) -> bytes:
+    return _mux_build_frame(sid, _MUX_STATUS_END, 0, b"", b"")
+
+
+async def _mux_relay_ws(
+    websocket,
+    initial_payload: bytes,
+    *,
+    use_warp: bool,
+    conn_id: str,
+    link_uid: str,
+    resp_prefix: bytes,
+):
+    """
+    VLESS command 0x03 Mux.Cool relay (TCP sub-streams + XUDP).
+
+    Keeps existing 0x01 TCP and 0x02 UDP paths untouched; this only runs when
+    the client opens a Mux session (e.g. mux.xudpConcurrency > 0).
+    """
+    decoder = _MuxFrameDecoder()
+    sessions = {}  # sid -> dict
+    # Per-session SOCKS UDP when Exit is on (avoids recv routing races).
+    first_down_sent = False
+    write_lock = asyncio.Lock()
+    closed = False
+
+    class _DirectUdpProto(asyncio.DatagramProtocol):
+        def __init__(self, q):
+            self.q = q
+
+        def datagram_received(self, data, addr):
+            try:
+                self.q.put_nowait((addr, data))
+            except Exception:
+                pass
+
+    async def ws_send(data: bytes):
+        nonlocal first_down_sent
+        if not data:
+            return
+        async with write_lock:
+            out = data
+            if not first_down_sent and resp_prefix:
+                out = resp_prefix + data
+                first_down_sent = True
+            await websocket.send_bytes(out)
+
+    async def account(n: int) -> bool:
+        if n <= 0:
+            return True
+        if not await check_and_add_usage(link_uid, n):
+            try:
+                await websocket.close(code=1008, reason="quota exceeded")
+            except Exception:
+                pass
+            return False
+        stats["total_bytes"] += n
+        async with connections_lock:
+            if conn_id in connections:
+                connections[conn_id]["bytes"] += n
+        return True
+
+    async def close_session(sid: int):
+        sess = sessions.pop(sid, None)
+        if not sess:
+            return
+        for t in list(sess.get("tasks") or []):
+            t.cancel()
+        try:
+            if sess.get("kind") == "tcp" and sess.get("writer"):
+                sess["writer"].close()
+                try:
+                    await sess["writer"].wait_closed()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if sess.get("kind") == "udp" and sess.get("transport"):
+                sess["transport"].close()
+        except Exception:
+            pass
+        try:
+            if sess.get("socks"):
+                await sess["socks"].close()
+        except Exception:
+            pass
+
+    async def udp_down_loop(sid: int):
+        """Read UDP replies and wrap as XUDP Keep frames."""
+        sess = sessions.get(sid)
+        if not sess:
+            return
+        try:
+            if use_warp:
+                s = sess.get("socks")
+                if not s:
+                    return
+                while sid in sessions:
+                    host, port, payload = await s.recv_ex(timeout=120.0)
+                    if not payload:
+                        continue
+                    if not await account(len(payload)):
+                        break
+                    h = host or sess.get("host") or "0.0.0.0"
+                    p = port or sess.get("port") or 0
+                    await ws_send(_mux_frame_xudp_keep(sid, h, p, payload))
+            else:
+                q = sess["uq"]
+                while sid in sessions:
+                    (addr, payload) = await asyncio.wait_for(q.get(), timeout=120.0)
+                    if not payload:
+                        continue
+                    if not await account(len(payload)):
+                        break
+                    h, p = addr[0], addr[1]
+                    await ws_send(_mux_frame_xudp_keep(sid, h, p, payload))
+        except Exception:
+            pass
+        finally:
+            try:
+                await ws_send(_mux_frame_end(sid))
+            except Exception:
+                pass
+            await close_session(sid)
+
+    async def tcp_down_loop(sid: int):
+        sess = sessions.get(sid)
+        if not sess or not sess.get("reader"):
+            return
+        reader = sess["reader"]
+        try:
+            while sid in sessions:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                if not await account(len(data)):
+                    break
+                await ws_send(_mux_frame_tcp_keep(sid, data))
+        except Exception:
+            pass
+        finally:
+            try:
+                await ws_send(_mux_frame_end(sid))
+            except Exception:
+                pass
+            await close_session(sid)
+
+    async def open_udp_session(sid: int, host: str, port: int, global_id: bytes, first_payload: bytes):
+        if sid in sessions:
+            await close_session(sid)
+        sess = {
+            "kind": "udp",
+            "host": host,
+            "port": port,
+            "global_id": global_id,
+            "tasks": [],
+        }
+        if use_warp:
+            from exit_proxy_manager import SocksUdpSession
+            s = SocksUdpSession(host, int(port))
+            await s.start(timeout=10.0)
+            sess["socks"] = s
+        else:
+            loop = asyncio.get_running_loop()
+            q: asyncio.Queue = asyncio.Queue()
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: _DirectUdpProto(q), local_addr=("0.0.0.0", 0)
+            )
+            sess["transport"] = transport
+            sess["uq"] = q
+        sessions[sid] = sess
+        t = asyncio.create_task(udp_down_loop(sid))
+        sess["tasks"].append(t)
+        if first_payload:
+            await send_udp(sid, host, port, first_payload)
+
+    async def send_udp(sid: int, host: str, port: int, payload: bytes):
+        if not payload:
+            return
+        if not await account(len(payload)):
+            return
+        sess = sessions.get(sid)
+        if not sess:
+            return
+        if use_warp:
+            s = sess.get("socks")
+            if not s:
+                return
+            await s.send_to(host, port, payload)
+            sess["host"], sess["port"] = host, port
+        else:
+            if not sess.get("transport"):
+                return
+            sess["transport"].sendto(payload, (host, port))
+            sess["host"], sess["port"] = host, port
+
+    async def open_tcp_session(sid: int, host: str, port: int, first_payload: bytes):
+        if sid in sessions:
+            await close_session(sid)
+        try:
+            reader, writer = await open_backend(host, port, use_warp=use_warp, timeout=10.0)
+        except Exception:
+            await ws_send(_mux_frame_end(sid))
+            return
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        sess = {"kind": "tcp", "reader": reader, "writer": writer, "tasks": [], "host": host, "port": port}
+        sessions[sid] = sess
+        t = asyncio.create_task(tcp_down_loop(sid))
+        sess["tasks"].append(t)
+        if first_payload:
+            if not await account(len(first_payload)):
+                await close_session(sid)
+                return
+            try:
+                writer.write(first_payload)
+                await writer.drain()
+            except Exception:
+                await close_session(sid)
+
+    async def handle_frame(sid: int, status: int, opt: int, rest: bytes, payload: bytes):
+        if status == _MUX_STATUS_KEEPALIVE:
+            return
+        if status == _MUX_STATUS_END:
+            await close_session(sid)
+            return
+        if status == _MUX_STATUS_NEW:
+            if len(rest) < 1:
+                return
+            net = rest[0]
+            try:
+                host, port, apos = _mux_parse_addr(rest, 1)
+            except ValueError:
+                return
+            global_id = b""
+            if net == _MUX_NET_UDP and apos + 8 <= len(rest):
+                global_id = rest[apos:apos + 8]
+            if net == _MUX_NET_UDP:
+                await open_udp_session(sid, host, port, global_id, payload if (opt & _MUX_OPT_DATA) else b"")
+            elif net == _MUX_NET_TCP:
+                await open_tcp_session(sid, host, port, payload if (opt & _MUX_OPT_DATA) else b"")
+            return
+        if status == _MUX_STATUS_KEEP:
+            sess = sessions.get(sid)
+            if not sess:
+                # XUDP may send Keep with addr without prior New on some paths
+                if len(rest) >= 1 and rest[0] == _MUX_NET_UDP:
+                    try:
+                        host, port, _ = _mux_parse_addr(rest, 1)
+                    except ValueError:
+                        return
+                    await open_udp_session(sid, host, port, b"", payload if (opt & _MUX_OPT_DATA) else b"")
+                return
+            if sess["kind"] == "tcp":
+                if payload and sess.get("writer"):
+                    if not await account(len(payload)):
+                        return
+                    try:
+                        sess["writer"].write(payload)
+                        await sess["writer"].drain()
+                    except Exception:
+                        await close_session(sid)
+                return
+            if sess["kind"] == "udp":
+                host, port = sess.get("host"), sess.get("port")
+                if len(rest) >= 1 and rest[0] == _MUX_NET_UDP:
+                    try:
+                        host, port, _ = _mux_parse_addr(rest, 1)
+                    except ValueError:
+                        pass
+                if host is not None and port is not None and payload:
+                    await send_udp(sid, host, int(port), payload)
+
+    try:
+        # Leftover after VLESS header may already contain Mux frames
+        for fr in decoder.feed(initial_payload or b""):
+            await handle_frame(*fr)
+
+        while not closed:
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            data = msg.get("bytes") or (msg.get("text") or "").encode()
+            if not data:
+                continue
+            for fr in decoder.feed(data):
+                await handle_frame(*fr)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        closed = True
+        for sid in list(sessions.keys()):
+            await close_session(sid)
+        # per-session socks closed in close_session
+
+
 async def open_backend(address: str, port: int, *, use_warp: bool = False, timeout: float = 10.0):
     """Open TCP to target. Direct path is unchanged; Exit Proxy only when use_warp/use_exit=True."""
     if not use_warp:
@@ -3808,7 +4247,14 @@ async def websocket_tunnel(websocket: WebSocket, auth: str, uuid: str):
         use_warp = bool(link_data_copy.get("use_warp"))
         # UDP command → dedicated relay (direct socket or SOCKS ASSOCIATE).
         # TCP (default) keeps the previous open_backend + stream relay path.
-        if _is_udp_command(auth, command):
+        if auth == "vless" and command == CMD_MUX_VLESS:
+            # Mux.Cool / XUDP — additional path; classic 0x01/0x02 unchanged.
+            await _mux_relay_ws(
+                websocket, initial_payload,
+                use_warp=use_warp, conn_id=conn_id, link_uid=uuid,
+                resp_prefix=response_prefix_for_protocol(auth),
+            )
+        elif _is_udp_command(auth, command):
             await _udp_relay_ws(
                 websocket, address, port, initial_payload,
                 use_warp=use_warp, conn_id=conn_id, link_uid=uuid,
