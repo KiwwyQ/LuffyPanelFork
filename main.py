@@ -3307,13 +3307,60 @@ async def subscription_endpoint(uid: str, request: Request):
 
 RELAY_BUF = 128 * 1024
 
-# VLESS: 1=TCP 2=UDP. Trojan (SOCKS-like): 1=TCP 3=UDP ASSOCIATE.
+# VLESS: 1=TCP, 2=UDP (length-prefixed body), 3=Mux (not handled here).
+# Trojan (SOCKS-like): 1=TCP, 3=UDP ASSOCIATE.
 CMD_TCP = 0x01
 CMD_UDP_VLESS = 0x02
+CMD_MUX_VLESS = 0x03
 CMD_UDP_TROJAN = 0x03
 
-def _is_udp_command(command: int) -> bool:
-    return command in (CMD_UDP_VLESS, CMD_UDP_TROJAN)
+def _is_udp_command(auth: str, command: int) -> bool:
+    """Return True only for protocol-native UDP commands (not VLESS Mux)."""
+    if auth == "trojan":
+        return command == CMD_UDP_TROJAN
+    # vless (default)
+    return command == CMD_UDP_VLESS
+
+
+# ── VLESS UDP body framing (Xray MultiLengthPacketWriter / LengthPacketReader) ──
+# Each datagram on the stream is: [uint16 BE length][payload].
+# WebSocket is only a transport; frames may split or merge packets, so we always
+# parse a contiguous byte buffer — never assume 1 WS message == 1 datagram.
+
+class _LengthPacketDecoder:
+    """Incremental decoder for Xray VLESS UDP body framing."""
+
+    __slots__ = ("_buf", "_max_payload")
+
+    def __init__(self, max_payload: int = 65535):
+        self._buf = bytearray()
+        self._max_payload = max_payload
+
+    def feed(self, data: bytes) -> list:
+        if not data:
+            return []
+        self._buf.extend(data)
+        out = []
+        while True:
+            if len(self._buf) < 2:
+                break
+            length = (self._buf[0] << 8) | self._buf[1]
+            if length == 0 or length > self._max_payload:
+                # Resync: drop one byte and try again (corrupt stream).
+                del self._buf[0]
+                continue
+            if len(self._buf) < 2 + length:
+                break
+            out.append(bytes(self._buf[2:2 + length]))
+            del self._buf[:2 + length]
+        return out
+
+
+def _encode_length_packet(payload: bytes) -> bytes:
+    n = len(payload)
+    if n == 0 or n > 65535:
+        return b""
+    return n.to_bytes(2, "big") + payload
 
 async def open_backend(address: str, port: int, *, use_warp: bool = False, timeout: float = 10.0):
     """Open TCP to target. Direct path is unchanged; Exit Proxy only when use_warp/use_exit=True."""
@@ -3336,18 +3383,31 @@ async def _udp_relay_ws(
     conn_id: str,
     link_uid: str,
     resp_prefix: bytes,
+    auth: str = "vless",
 ):
     """
-    Relay VLESS/Trojan UDP over the existing WebSocket.
-    - Direct: OS UDP socket to target
-    - Exit Proxy: SOCKS5 UDP ASSOCIATE via local sing-box
-    Framing: each WS binary message is one UDP datagram payload (simple mode).
-    First downstream packet is prefixed with resp_prefix for VLESS.
+    Relay VLESS/Trojan UDP over the existing WebSocket connection.
+
+    Backend:
+      - Direct: OS UDP socket to (address, port)
+      - Exit Proxy: SOCKS5 UDP ASSOCIATE via local sing-box
+
+    Framing (must match Xray):
+      - VLESS command 0x02: body is repeated [uint16 BE length][payload]
+        on a byte stream (WS messages may split/merge packets).
+      - Trojan UDP ASSOCIATE: each WS binary message is one raw datagram
+        (SOCKS-style simple mode; Trojan does not use VLESS length frames).
+
+    First downlink chunk is prefixed with resp_prefix for VLESS (version+addons).
+    TCP path is completely separate and unchanged.
     """
     transport = None
     protocol = None
     socks_sess = None
     first_down = True
+    # VLESS UDP uses length-prefixed stream; Trojan keeps simple mode.
+    length_framed = (auth != "trojan")
+    decoder = _LengthPacketDecoder() if length_framed else None
 
     class _Proto(asyncio.DatagramProtocol):
         def __init__(self):
@@ -3360,6 +3420,8 @@ async def _udp_relay_ws(
                 pass
 
     async def send_udp(payload: bytes):
+        if not payload:
+            return
         if use_warp:
             await socks_sess.send(payload)
         else:
@@ -3369,6 +3431,33 @@ async def _udp_relay_ws(
         if use_warp:
             return await socks_sess.recv(timeout=120.0)
         return await asyncio.wait_for(protocol.q.get(), timeout=120.0)
+
+    async def account_bytes(n: int) -> bool:
+        if n <= 0:
+            return True
+        if not await check_and_add_usage(link_uid, n):
+            try:
+                await websocket.close(code=1008, reason="quota exceeded")
+            except Exception:
+                pass
+            return False
+        stats["total_bytes"] += n
+        async with connections_lock:
+            if conn_id in connections:
+                connections[conn_id]["bytes"] += n
+        return True
+
+    async def handle_uplink_raw(data: bytes) -> bool:
+        """Decode (if needed) and forward uplink datagrams. False = stop."""
+        if length_framed:
+            packets = decoder.feed(data)
+        else:
+            packets = [data] if data else []
+        for pkt in packets:
+            if not await account_bytes(len(pkt)):
+                return False
+            await send_udp(pkt)
+        return True
 
     try:
         if use_warp:
@@ -3382,15 +3471,11 @@ async def _udp_relay_ws(
                 lambda: protocol, local_addr=("0.0.0.0", 0)
             )
 
+        # Bytes left after the VLESS/Trojan header may already contain
+        # one or more length-prefixed datagrams (or a partial frame).
         if initial_payload:
-            if not await check_and_add_usage(link_uid, len(initial_payload)):
-                await websocket.close(code=1008, reason="quota exceeded")
+            if not await handle_uplink_raw(initial_payload):
                 return
-            stats["total_bytes"] += len(initial_payload)
-            async with connections_lock:
-                if conn_id in connections:
-                    connections[conn_id]["bytes"] += len(initial_payload)
-            await send_udp(initial_payload)
 
         async def up():
             try:
@@ -3401,14 +3486,8 @@ async def _udp_relay_ws(
                     data = msg.get("bytes") or (msg.get("text") or "").encode()
                     if not data:
                         continue
-                    if not await check_and_add_usage(link_uid, len(data)):
-                        await websocket.close(code=1008, reason="quota exceeded")
+                    if not await handle_uplink_raw(data):
                         break
-                    stats["total_bytes"] += len(data)
-                    async with connections_lock:
-                        if conn_id in connections:
-                            connections[conn_id]["bytes"] += len(data)
-                    await send_udp(data)
             except WebSocketDisconnect:
                 pass
             except Exception:
@@ -3421,14 +3500,15 @@ async def _udp_relay_ws(
                     data = await recv_udp()
                     if not data:
                         continue
-                    if not await check_and_add_usage(link_uid, len(data)):
-                        await websocket.close(code=1008, reason="quota exceeded")
+                    if not await account_bytes(len(data)):
                         break
-                    stats["total_bytes"] += len(data)
-                    async with connections_lock:
-                        if conn_id in connections:
-                            connections[conn_id]["bytes"] += len(data)
-                    out = (resp_prefix + data) if (first_down and resp_prefix) else data
+                    if length_framed:
+                        framed = _encode_length_packet(data)
+                        if not framed:
+                            continue
+                        out = (resp_prefix + framed) if (first_down and resp_prefix) else framed
+                    else:
+                        out = (resp_prefix + data) if (first_down and resp_prefix) else data
                     first_down = False
                     await websocket.send_bytes(out)
             except Exception:
@@ -3454,6 +3534,7 @@ async def _udp_relay_ws(
                 await socks_sess.close()
             except Exception:
                 pass
+
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
@@ -3727,11 +3808,12 @@ async def websocket_tunnel(websocket: WebSocket, auth: str, uuid: str):
         use_warp = bool(link_data_copy.get("use_warp"))
         # UDP command → dedicated relay (direct socket or SOCKS ASSOCIATE).
         # TCP (default) keeps the previous open_backend + stream relay path.
-        if _is_udp_command(command):
+        if _is_udp_command(auth, command):
             await _udp_relay_ws(
                 websocket, address, port, initial_payload,
                 use_warp=use_warp, conn_id=conn_id, link_uid=uuid,
                 resp_prefix=response_prefix_for_protocol(auth),
+                auth=auth,
             )
         else:
             reader, writer = await open_backend(address, port, use_warp=use_warp, timeout=10.0)

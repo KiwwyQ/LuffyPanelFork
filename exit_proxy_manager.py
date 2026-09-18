@@ -321,6 +321,11 @@ def _parse_vless_link(link: str) -> dict:
     sni = _qs_first(qs, "sni", "serverName", "servername", "peer")
     net = _qs_first(qs, "type", "network", "net") or "tcp"
     packet_encoding = _qs_first(qs, "packetEncoding", "packetencoding", "packet_encoding")
+    # UDP over VLESS (WebRTC, games, DNS, QUIC) needs packet encoding.
+    # xudp is the modern default used by Xray/sing-box; without it many
+    # exits silently drop UDP even though TCP works fine.
+    if not packet_encoding:
+        packet_encoding = "xudp"
 
     outbound: dict[str, Any] = {
         "type": "vless",
@@ -328,14 +333,13 @@ def _parse_vless_link(link: str) -> dict:
         "server": host,
         "server_port": int(port),
         "uuid": uuid,
+        "packet_encoding": packet_encoding,
     }
     if flow:
         outbound["flow"] = flow
     if encryption and encryption != "none":
         # sing-box ignores encryption for vless (always none); keep silent
         pass
-    if packet_encoding:
-        outbound["packet_encoding"] = packet_encoding
 
     tls = _build_tls_from_params(qs, security, sni, host)
     if tls:
@@ -589,9 +593,12 @@ def _normalize_user_outbound(raw: Any) -> list[dict]:
         t = str(ob.get("type") or "").lower()
         if t in ("direct", "block", "dns", "selector", "urltest", "uri"):
             continue
+        ob = dict(ob)
         if not ob.get("tag"):
-            ob = dict(ob)
             ob["tag"] = f"exit-{i}" if i else "exit"
+        # Ensure VLESS can carry UDP (WebRTC, Roblox, QUIC, DNS over UDP).
+        if t == "vless" and not ob.get("packet_encoding"):
+            ob["packet_encoding"] = "xudp"
         cleaned.append(ob)
 
     if not cleaned:
