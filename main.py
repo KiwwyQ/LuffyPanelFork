@@ -218,6 +218,10 @@ CONFIG = {
     "bot_lang": "en",
     "railway_token": "",
     "notify_connections": "0",
+    "exit_enabled": "0",
+    "exit_config": "",
+    "exit_log_level": "warn",
+    # Legacy keys kept for one-time migration from older WARP installs
     "warp_enabled": "0",
     "warp_mtu": "1280",
     "warp_ipv4_only": "0",
@@ -910,7 +914,8 @@ async def save_db():
                 for addr in CUSTOM_ADDRESSES:
                     db_execute(conn, "INSERT INTO custom_addresses (address) VALUES (?)", (addr,))
             # Save settings
-            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections", "warp_enabled", "warp_mtu", "warp_ipv4_only"):
+            for key in ("telegram_token", "telegram_admin_id", "bot_lang", "railway_token", "notify_connections",
+                        "exit_enabled", "exit_config", "exit_log_level"):
                 db_execute(conn, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, CONFIG.get(key, "")))
             conn.commit()
     except Exception as e:
@@ -969,6 +974,13 @@ def load_db():
         cur = db_execute(conn, "SELECT key, value FROM settings")
         for row in cur.fetchall():
             CONFIG[row["key"]] = row["value"]
+        # One-time migration: old WARP flags → Exit Proxy
+        if CONFIG.get("exit_enabled") in (None, "") and CONFIG.get("warp_enabled") in ("1", "true", "True"):
+            CONFIG["exit_enabled"] = "1"
+        if not CONFIG.get("exit_log_level"):
+            CONFIG["exit_log_level"] = "warn"
+        if CONFIG.get("exit_config") is None:
+            CONFIG["exit_config"] = ""
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
     finally:
@@ -1055,27 +1067,22 @@ async def startup():
     asyncio.create_task(telegram_notifier_cron())
     await ensure_default_link()
     try:
-        from warp_manager import bootstrap_from_settings
-        try:
-            from warp_manager import set_options_memory, bootstrap_from_settings as _warp_boot
-            set_options_memory(
-                mtu=int(CONFIG.get("warp_mtu") or 1280),
-                ipv4_only=CONFIG.get("warp_ipv4_only", "0") in ("1", "true", "True", True),
-            )
-            await _warp_boot(CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True))
-        except Exception:
-            from warp_manager import bootstrap_from_settings
-            await bootstrap_from_settings(CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True))
+        from exit_proxy_manager import bootstrap_from_settings
+        await bootstrap_from_settings(
+            enabled=CONFIG.get("exit_enabled", "0") in ("1", "true", "True", True),
+            config_json=CONFIG.get("exit_config") or "",
+            log_level=CONFIG.get("exit_log_level") or "warn",
+        )
     except Exception as e:
-        logger.warning(f"WARP bootstrap skipped: {e}")
+        logger.warning(f"Exit Proxy bootstrap skipped: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
     await _stop_telegram_bot()
     await clear_expired_sessions()
     try:
-        from warp_manager import stop_warp
-        await stop_warp()
+        from exit_proxy_manager import stop_exit
+        await stop_exit()
     except Exception:
         pass
     if http_client:
@@ -1806,29 +1813,33 @@ async def get_settings(_=Depends(require_auth)):
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "railway_token": CONFIG.get("railway_token", ""),
         "notify_connections": CONFIG.get("notify_connections", "0") in ("1", "true", "True", True),
-        "warp_enabled": CONFIG.get("warp_enabled", "0") in ("1", "true", "True", True),
-        "warp_mtu": int(CONFIG.get("warp_mtu") or 1280),
-        "warp_ipv4_only": CONFIG.get("warp_ipv4_only", "0") in ("1", "true", "True", True),
+        "exit_enabled": CONFIG.get("exit_enabled", "0") in ("1", "true", "True", True),
+        "exit_config": CONFIG.get("exit_config") or "",
+        "exit_log_level": CONFIG.get("exit_log_level") or "warn",
         "using_neon": USE_POSTGRES,
     }
 
-@app.get("/api/warp/status")
-async def api_warp_status(_=Depends(require_auth)):
+@app.get("/api/exit/status")
+async def api_exit_status(_=Depends(require_auth)):
     try:
-        from warp_manager import get_status
-        return get_status()
+        from exit_proxy_manager import get_status, get_options
+        return {**get_status(), **get_options()}
     except Exception as e:
-        return {"enabled": False, "running": False, "socks_ok": False, "last_error": str(e)}
+        return {"enabled": False, "running": False, "socks_ok": False, "last_error": str(e), "has_config": False}
+
+@app.post("/api/exit/restart")
+async def api_exit_restart(_=Depends(require_auth)):
+    from exit_proxy_manager import restart_exit
+    return await restart_exit()
+
+# Keep old paths as thin aliases so any cached UI still works
+@app.get("/api/warp/status")
+async def api_warp_status_alias(_=Depends(require_auth)):
+    return await api_exit_status()
 
 @app.post("/api/warp/restart")
-async def api_warp_restart(_=Depends(require_auth)):
-    from warp_manager import restart_warp
-    return await restart_warp()
-
-@app.post("/api/warp/regenerate")
-async def api_warp_regenerate(_=Depends(require_auth)):
-    from warp_manager import regenerate_config
-    return await regenerate_config()
+async def api_warp_restart_alias(_=Depends(require_auth)):
+    return await api_exit_restart()
 
 @app.get("/api/setup-status")
 async def api_setup_status(_=Depends(require_auth)):
@@ -1871,48 +1882,43 @@ async def update_settings(request: Request, _=Depends(require_auth)):
         CONFIG["railway_token"] = (body.get("railway_token") or "").strip()
     if "notify_connections" in body:
         CONFIG["notify_connections"] = "1" if body.get("notify_connections") else "0"
-    warp_changed = False
-    tunables_changed = False
-    if "warp_enabled" in body:
-        new_w = "1" if body.get("warp_enabled") else "0"
-        warp_changed = new_w != str(CONFIG.get("warp_enabled", "0"))
-        CONFIG["warp_enabled"] = new_w
-    if "warp_mtu" in body:
-        try:
-            mtu = int(body.get("warp_mtu") or 1280)
-        except (TypeError, ValueError):
-            mtu = 1280
-        mtu = max(576, min(1500, mtu))
-        if str(mtu) != str(CONFIG.get("warp_mtu", "1280")):
-            tunables_changed = True
-        CONFIG["warp_mtu"] = str(mtu)
-    if "warp_ipv4_only" in body:
-        new_v4 = "1" if body.get("warp_ipv4_only") else "0"
-        if new_v4 != str(CONFIG.get("warp_ipv4_only", "0")):
-            tunables_changed = True
-        CONFIG["warp_ipv4_only"] = new_v4
+    exit_changed = False
+    config_changed = False
+    if "exit_enabled" in body:
+        new_e = "1" if body.get("exit_enabled") else "0"
+        exit_changed = new_e != str(CONFIG.get("exit_enabled", "0"))
+        CONFIG["exit_enabled"] = new_e
+    if "exit_config" in body:
+        new_cfg = (body.get("exit_config") or "").strip()
+        if new_cfg != str(CONFIG.get("exit_config") or ""):
+            config_changed = True
+        CONFIG["exit_config"] = new_cfg
+    if "exit_log_level" in body:
+        new_lvl = str(body.get("exit_log_level") or "warn").strip().lower()
+        if new_lvl not in ("trace", "debug", "info", "warn", "error", "fatal", "panic"):
+            new_lvl = "warn"
+        if new_lvl != str(CONFIG.get("exit_log_level") or "warn"):
+            config_changed = True
+        CONFIG["exit_log_level"] = new_lvl
     await save_db()
     await restart_telegram_bot()
-    if warp_changed:
+    if exit_changed or config_changed:
         try:
-            from warp_manager import set_enabled, set_options_memory
+            from exit_proxy_manager import set_enabled, apply_config, set_options_memory
             set_options_memory(
-                mtu=int(CONFIG.get("warp_mtu") or 1280),
-                ipv4_only=CONFIG.get("warp_ipv4_only") == "1",
+                config_json=CONFIG.get("exit_config") or "",
+                log_level=CONFIG.get("exit_log_level") or "warn",
             )
-            await set_enabled(CONFIG.get("warp_enabled") == "1")
+            if config_changed:
+                await apply_config(
+                    config_json=CONFIG.get("exit_config") or "",
+                    log_level=CONFIG.get("exit_log_level") or "warn",
+                    restart=CONFIG.get("exit_enabled") == "1",
+                )
+            if exit_changed:
+                await set_enabled(CONFIG.get("exit_enabled") == "1")
         except Exception as e:
-            logger.error(f"WARP toggle error: {e}")
-    elif tunables_changed:
-        try:
-            from warp_manager import apply_tunables
-            await apply_tunables(
-                mtu=int(CONFIG.get("warp_mtu") or 1280),
-                ipv4_only=CONFIG.get("warp_ipv4_only") == "1",
-                restart=True,
-            )
-        except Exception as e:
-            logger.error(f"WARP tunables error: {e}")
+            logger.error(f"Exit Proxy settings error: {e}")
     return {"ok": True}
 
 # ── Railway / Permanent Database ──────────────────────────────────────────
@@ -3310,13 +3316,13 @@ def _is_udp_command(command: int) -> bool:
     return command in (CMD_UDP_VLESS, CMD_UDP_TROJAN)
 
 async def open_backend(address: str, port: int, *, use_warp: bool = False, timeout: float = 10.0):
-    """Open TCP to target. Direct path is unchanged; WARP only when use_warp=True."""
+    """Open TCP to target. Direct path is unchanged; Exit Proxy only when use_warp/use_exit=True."""
     if not use_warp:
         return await asyncio.wait_for(asyncio.open_connection(address, port), timeout=timeout)
     try:
-        from warp_manager import open_socks_connection
+        from exit_proxy_manager import open_socks_connection
     except Exception as e:
-        raise OSError(f"WARP module unavailable: {e}") from e
+        raise OSError(f"Exit Proxy module unavailable: {e}") from e
     return await open_socks_connection(address, port, timeout=timeout)
 
 
@@ -3334,7 +3340,7 @@ async def _udp_relay_ws(
     """
     Relay VLESS/Trojan UDP over the existing WebSocket.
     - Direct: OS UDP socket to target
-    - WARP: SOCKS5 UDP ASSOCIATE via local sing-box
+    - Exit Proxy: SOCKS5 UDP ASSOCIATE via local sing-box
     Framing: each WS binary message is one UDP datagram payload (simple mode).
     First downstream packet is prefixed with resp_prefix for VLESS.
     """
@@ -3366,7 +3372,7 @@ async def _udp_relay_ws(
 
     try:
         if use_warp:
-            from warp_manager import SocksUdpSession
+            from exit_proxy_manager import SocksUdpSession
             socks_sess = SocksUdpSession(address, port)
             await socks_sess.start(timeout=10.0)
         else:
@@ -4278,7 +4284,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <div class="stat-card" style="animation-delay:.16s"><div class="stat-label" data-en="Inbounds" data-fa="اینباندها">Inbounds</div><div class="stat-val" id="sv-links">-</div></div>
         <div class="stat-card" style="animation-delay:.24s"><div class="stat-label" data-en="Uptime" data-fa="آپتایم">Uptime</div><div class="stat-val" id="sv-uptime" style="font-size:15px">-</div></div>
         <div class="stat-card" style="animation-delay:.32s"><div class="stat-label" data-en="Domain" data-fa="دامنه">Domain</div><div class="stat-val" id="sv-domain" style="font-size:10px;word-break:break-all;font-weight:500">-</div></div>
-        <div class="stat-card" style="animation-delay:.40s"><div class="stat-label">WARP</div><div class="stat-val" id="sv-warp" style="font-size:13px">-</div><div class="stat-label" id="sv-warp-sub" style="margin-top:6px;font-size:11px;opacity:.7"></div></div>
+        <div class="stat-card" style="animation-delay:.40s"><div class="stat-label">Exit</div><div class="stat-val" id="sv-warp" style="font-size:13px">-</div><div class="stat-label" id="sv-warp-sub" style="margin-top:6px;font-size:11px;opacity:.7"></div></div>
       </div>
       <div class="grid-2">
         <div class="card">
@@ -4459,27 +4465,31 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       </div>
     
         <div class="card" style="margin-top:16px">
-          <div style="font-weight:600;margin-bottom:10px" data-en="Cloudflare WARP exit" data-fa="خروجی WARP">Cloudflare WARP exit</div>
-          <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Optional userspace WARP→SOCKS exit. Direct inbounds are unchanged. Requires outbound UDP to Cloudflare." data-fa="خروجی اختیاری WARP. اینباندهای مستقیم تغییری نمی‌کنند.">Optional userspace WARP→SOCKS exit. Direct inbounds are unchanged. Requires outbound UDP to Cloudflare.</div>
+          <div style="font-weight:600;margin-bottom:10px" data-en="Exit Proxy" data-fa="خروجی پروکسی">Exit Proxy</div>
+          <div style="font-size:12px;color:var(--text3);margin-bottom:12px;line-height:1.5" data-en="Optional userspace exit via sing-box. Paste a share link (vless://, trojan://, ss://, vmess://) or raw outbound JSON. Inbounds with “Use Exit Proxy” go through it; others stay direct. Supports TCP + UDP." data-fa="خروجی اختیاری با sing-box. لینک اشتراک یا JSON را بچسبانید. اینباندهای مستقیم تغییری نمی‌کنند. پشتیبانی از TCP و UDP.">Optional userspace exit via sing-box. Paste a share link (vless://, trojan://, ss://, vmess://) or raw outbound JSON. Inbounds with “Use Exit Proxy” go through it; others stay direct. Supports TCP + UDP.</div>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer">
-            <input type="checkbox" id="warp-enabled-cb" onchange="saveWarpEnabled()">
-            <span data-en="Enable WARP process" data-fa="فعال‌سازی WARP">Enable WARP process</span>
+            <input type="checkbox" id="exit-enabled-cb" onchange="saveExitEnabled()">
+            <span data-en="Enable Exit Proxy process" data-fa="فعال‌سازی Exit Proxy">Enable Exit Proxy process</span>
           </label>
-          <div style="font-size:11px;color:var(--text3);margin-bottom:8px" data-en="Saves and starts/stops immediately when toggled." data-fa="با تغییر فوراً ذخیره و اجرا می‌شود.">Saves and starts/stops immediately when toggled.</div>
+          <div style="font-size:11px;color:var(--text3);margin-bottom:8px" data-en="Saves and starts/stops immediately when toggled. Requires a valid outbound JSON below." data-fa="با تغییر فوراً ذخیره و اجرا می‌شود. نیاز به JSON معتبر دارد.">Saves and starts/stops immediately when toggled. Requires a valid outbound JSON below.</div>
           <div class="fg" style="margin-bottom:10px">
-            <label class="fl" data-en="WARP MTU (576–1500)" data-fa="MTU">WARP MTU (576–1500)</label>
-            <input class="fi" type="number" id="warp-mtu-in" min="576" max="1500" step="10" value="1280" style="max-width:140px">
-            <div style="font-size:11px;color:var(--text3);margin-top:4px" data-en="Lower if HTTPS stalls (try 1200 or 1100). Applied on Save tunables + restart." data-fa="اگر HTTPS گیر کرد کمتر کنید.">Lower if HTTPS stalls (try 1200 or 1100). Applied on Save tunables + restart.</div>
+            <label class="fl" data-en="Outbound config (JSON or share link)" data-fa="کانفیگ خروجی (JSON یا لینک)">Outbound config (JSON or share link)</label>
+            <textarea class="fi" id="exit-config-ta" rows="10" spellcheck="false" placeholder="vless://uuid@host:443?encryption=none&amp;security=tls&amp;type=ws&amp;path=/&amp;sni=host#name&#10;or JSON: {&quot;type&quot;:&quot;vless&quot;,...}" style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.4;resize:vertical;min-height:140px"></textarea>
+            <div style="font-size:11px;color:var(--text3);margin-top:4px" data-en="Paste a share link (vless://, trojan://, ss://, vmess://) or a sing-box outbound JSON. Tag is optional (defaults to exit)." data-fa="لینک اشتراک یا JSON خروجی sing-box را بچسبانید.">Paste a share link (vless://, trojan://, ss://, vmess://) or a sing-box outbound JSON. Tag is optional (defaults to exit).</div>
           </div>
-          <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer">
-            <input type="checkbox" id="warp-ipv4-only-cb">
-            <span data-en="IPv4 only (omit WARP IPv6 address)" data-fa="فقط IPv4">IPv4 only (omit WARP IPv6 address)</span>
-          </label>
-          <button type="button" class="btn btn-gold" onclick="saveWarpTunables()" style="margin-bottom:12px;width:100%;justify-content:center" data-en="Save MTU / IPv4 + restart WARP" data-fa="ذخیره MTU و ری‌استارت">Save MTU / IPv4 + restart WARP</button>
-          <div id="warp-status-line" style="font-size:12px;margin-bottom:10px;color:var(--text2)">Status: —</div>
+          <div class="fg" style="margin-bottom:10px">
+            <label class="fl" data-en="Log level" data-fa="سطح لاگ">Log level</label>
+            <select class="fs" id="exit-log-level" style="max-width:140px">
+              <option value="warn">warn</option>
+              <option value="info">info</option>
+              <option value="debug">debug</option>
+              <option value="error">error</option>
+            </select>
+          </div>
+          <button type="button" class="btn btn-gold" onclick="saveExitConfig()" style="margin-bottom:12px;width:100%;justify-content:center" data-en="Save config + restart Exit Proxy" data-fa="ذخیره کانفیگ و ری‌استارت">Save config + restart Exit Proxy</button>
+          <div id="exit-status-line" style="font-size:12px;margin-bottom:10px;color:var(--text2)">Status: —</div>
           <div style="display:flex;flex-wrap:wrap;gap:8px">
-            <button type="button" class="btn btn-ghost" onclick="warpRestart()" data-en="Reboot WARP" data-fa="ری‌استارت">Reboot WARP</button>
-            <button type="button" class="btn btn-ghost" onclick="warpRegenerate()" data-en="Regenerate config" data-fa="ساخت مجدد کانفیگ">Regenerate config</button>
+            <button type="button" class="btn btn-ghost" onclick="exitRestart()" data-en="Restart process" data-fa="ری‌استارت">Restart process</button>
           </div>
         </div>
 </section>
@@ -4571,7 +4581,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </div>
     <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;cursor:pointer">
       <input type="checkbox" id="n-use-warp">
-      <span data-en="Use WARP exit (off = direct)" data-fa="خروجی WARP (خاموش = مستقیم)">Use WARP exit (off = direct)</span>
+      <span data-en="Use Exit Proxy (off = direct)" data-fa="خروجی Exit Proxy (خاموش = مستقیم)">Use Exit Proxy (off = direct)</span>
     </label>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
@@ -4590,7 +4600,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
     <label style="display:flex;align-items:center;gap:8px;margin:8px 0;font-size:13px;cursor:pointer">
       <input type="checkbox" id="e-use-warp">
-      <span data-en="Use WARP exit" data-fa="خروجی WARP">Use WARP exit</span>
+      <span data-en="Use Exit Proxy" data-fa="خروجی Exit Proxy">Use Exit Proxy</span>
     </label>
     <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = no change"></div>
     <div class="fg" style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:4px">
@@ -5190,7 +5200,7 @@ function dlQR(){
 
 async function refreshWarpStatus(){
   try{
-    const r=await fetch('/api/warp/status');
+    const r=await fetch('/api/exit/status');
     const d=await r.json();
     const el=$m('sv-warp');
     const sub=$m('sv-warp-sub');
@@ -5201,20 +5211,20 @@ async function refreshWarpStatus(){
       else {el.textContent='Down';el.style.color='var(--red)';}
     }
     if(sub) sub.textContent=d.last_error?String(d.last_error).slice(0,80):(d.socks||'');
-    const line=$m('warp-status-line');
+    const line=$m('exit-status-line');
     if(line){
-      line.textContent='Status: '+(d.enabled?'enabled':'disabled')+' | running='+!!d.running+' | socks_ok='+!!d.socks_ok+(d.last_error?' | '+d.last_error:'');
+      line.textContent='Status: '+(d.enabled?'enabled':'disabled')+' | running='+!!d.running+' | socks_ok='+!!d.socks_ok+(d.has_config?' | config=yes':' | config=empty')+(d.last_error?' | '+d.last_error:'');
     }
-    const cb=$m('warp-enabled-cb');
+    const cb=$m('exit-enabled-cb');
     if(cb && document.activeElement!==cb) cb.checked=!!d.enabled;
   }catch(e){}
 }
-async function saveWarpEnabled(){
-  const on=!!($m('warp-enabled-cb')&&$m('warp-enabled-cb').checked);
-  const cb=$m('warp-enabled-cb');
+async function saveExitEnabled(){
+  const on=!!($m('exit-enabled-cb')&&$m('exit-enabled-cb').checked);
+  const cb=$m('exit-enabled-cb');
   if(cb) cb.disabled=true;
   try{
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warp_enabled:on})});
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({exit_enabled:on})});
     setTimeout(refreshWarpStatus,1000);
   }catch(e){
     if(cb) cb.checked=!on;
@@ -5222,24 +5232,25 @@ async function saveWarpEnabled(){
     if(cb) cb.disabled=false;
   }
 }
-async function saveWarpTunables(){
-  let mtu=parseInt(($m('warp-mtu-in')&&$m('warp-mtu-in').value)||'1280',10);
-  if(isNaN(mtu)) mtu=1280;
-  const ipv4=!!($m('warp-ipv4-only-cb')&&$m('warp-ipv4-only-cb').checked);
+async function saveExitConfig(){
+  const cfg=($m('exit-config-ta')&&$m('exit-config-ta').value)||'';
+  const lvl=($m('exit-log-level')&&$m('exit-log-level').value)||'warn';
+  const t=cfg.trim();
+  if(t){
+    const isLink=/^(vless|trojan|ss|vmess):\/\//i.test(t) || t.split('\n').some(l=>/^(vless|trojan|ss|vmess):\/\//i.test(l.trim()));
+    if(!isLink && (t.startsWith('{') || t.startsWith('['))){
+      try{ JSON.parse(t); }catch(e){ toast('Invalid JSON: '+e.message,true); return; }
+    }
+  }
   try{
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({warp_mtu:mtu,warp_ipv4_only:ipv4})});
-    toast('WARP tunables saved — process restarted if running');
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({exit_config:cfg,exit_log_level:lvl})});
+    toast('Exit Proxy config saved — process restarted if enabled');
     setTimeout(refreshWarpStatus,1500);
-  }catch(e){toast('Failed to save tunables',true)}
+  }catch(e){toast('Failed to save Exit Proxy config',true)}
 }
-async function warpRestart(){
-  await fetch('/api/warp/restart',{method:'POST'});
+async function exitRestart(){
+  await fetch('/api/exit/restart',{method:'POST'});
   setTimeout(refreshWarpStatus,1000);
-}
-async function warpRegenerate(){
-  if(!confirm('Regenerate WARP account/config and restart?'))return;
-  await fetch('/api/warp/regenerate',{method:'POST'});
-  setTimeout(refreshWarpStatus,1500);
 }
 
 async function loadSettings(){
@@ -5252,9 +5263,9 @@ async function loadSettings(){
       if($m('rw-tg-admin'))$m('rw-tg-admin').value=d.telegram_admin_id||'';
       if($m('rw-token'))$m('rw-token').value=d.railway_token||'';
       if($m('rw-tg-notify-conn'))$m('rw-tg-notify-conn').checked=!!d.notify_connections;
-      if($m('warp-enabled-cb'))$m('warp-enabled-cb').checked=!!d.warp_enabled;
-      if($m('warp-mtu-in')&&d.warp_mtu!=null)$m('warp-mtu-in').value=d.warp_mtu;
-      if($m('warp-ipv4-only-cb'))$m('warp-ipv4-only-cb').checked=!!d.warp_ipv4_only;
+      if($m('exit-enabled-cb'))$m('exit-enabled-cb').checked=!!d.exit_enabled;
+      if($m('exit-config-ta')&&d.exit_config!=null)$m('exit-config-ta').value=d.exit_config||'';
+      if($m('exit-log-level')&&d.exit_log_level)$m('exit-log-level').value=d.exit_log_level;
     }
   }catch(e){}
 }
